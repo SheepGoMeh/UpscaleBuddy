@@ -5,6 +5,7 @@ using System.Diagnostics;
 using Dalamud.Game.Config;
 using Dalamud.Hooking;
 
+using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using FFXIVClientStructs.FFXIV.Client.Graphics.PostEffect;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Render;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
@@ -30,6 +31,10 @@ public unsafe class DlssPath: IDisposable
 	private const string DestroyParametersSignature = "E8 ?? ?? ?? ?? 33 C9 E8 ?? ?? ?? ?? 80 A7";
 	private const string ShutdownSignature = "E8 ?? ?? ?? ?? 80 A3 ?? ?? ?? ?? ?? 48 8B 8B";
 
+	// FUN_1402db4f0, render target size: render resolution targets are allocated (FUN_1402dc1a0) and sized
+	// (FUN_1402dac20) from its result, clamped to the display height
+	private const string RenderSizeSignature = "E8 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? B9";
+
 	// From PostEffectManager setup (FUN_1403528a0), only done on DLSS capable GPUs
 	// MemAlloc(0x188), ctor, PostEffectManager+0x4220, RenderTargetManager+0x730 = render size callback
 	private const string MemAllocSignature = "E8 ?? ?? ?? ?? 48 8B F8 41 BE";
@@ -39,6 +44,7 @@ public unsafe class DlssPath: IDisposable
 	private const int DlssObjectOffset = 0x4220;
 	private const int RenderSizeCallbackOffset = 0x730;
 	private const int CachedOutputSizeOffset = 0x150; // -1 makes the game query the render size again
+	private const int DeviceResizePendingOffset = 0x7A; // PostTick: release callbacks, swapchain resize, recreate callbacks
 	private const int StateFlagsOffset = 0x181; // bit 0 NGX initialized, bit 1 feature created
 	private const int ParametersOffset = 0x158;
 	private const int FeatureOffset = 0x160;
@@ -56,6 +62,7 @@ public unsafe class DlssPath: IDisposable
 	private delegate int EvaluateDelegate(nint context, nint handle, nint parameters, nint progress);
 	private delegate int HandleDelegate(nint handle);
 	private delegate int OptimalSettingsDelegate(nint parameters);
+	private delegate void RenderSizeDelegate(nint renderTargetManager, uint* size, byte allocate);
 
 	private enum State
 	{
@@ -73,6 +80,7 @@ public unsafe class DlssPath: IDisposable
 	private readonly Hook<HandleDelegate>? releaseHook;
 	private readonly Hook<HandleDelegate>? destroyParametersHook;
 	private readonly Hook<HandleDelegate>? shutdownHook;
+	private readonly Hook<RenderSizeDelegate>? renderSizeHook;
 	private readonly delegate* unmanaged<ulong, ulong, ulong, nint> memAlloc;
 	private readonly delegate* unmanaged<nint, nint> dlssObjectCtor;
 	private readonly nint renderSizeCallback;
@@ -80,6 +88,8 @@ public unsafe class DlssPath: IDisposable
 
 	// Written on the framework thread, read on the render thread
 	private volatile float scale = 1.0f;
+	private volatile float supersample = 1.0f;
+	private float allocatedSupersample = 1.0f;
 	private volatile bool sharpen;
 	private volatile float sharpness;
 	private volatile bool measure;
@@ -90,7 +100,8 @@ public unsafe class DlssPath: IDisposable
 
 	// Render thread
 	private Fsr3Upscaler? upscaler;
-	private readonly List<Fsr3Upscaler> retired = [];
+	private Downsampler? downsampler;
+	private readonly List<IDisposable> retired = [];
 	private readonly object upscalerLock = new();
 	private long lastEvaluate;
 	private bool loggedEvaluateError;
@@ -132,6 +143,8 @@ public unsafe class DlssPath: IDisposable
 				Service.SigScanner.ScanText(DestroyParametersSignature), _ => NgxParameters.Success);
 			this.shutdownHook = Service.GameInteropProvider.HookFromAddress<HandleDelegate>(
 				Service.SigScanner.ScanText(ShutdownSignature), _ => NgxParameters.Success);
+			this.renderSizeHook = Service.GameInteropProvider.HookFromAddress<RenderSizeDelegate>(
+				Service.SigScanner.ScanText(RenderSizeSignature), this.RenderSizeDetour);
 
 			this.memAlloc = (delegate* unmanaged<ulong, ulong, ulong, nint>)Service.SigScanner.ScanText(MemAllocSignature);
 			this.dlssObjectCtor = (delegate* unmanaged<nint, nint>)Service.SigScanner.ScanText(DlssObjectCtorSignature);
@@ -165,6 +178,38 @@ public unsafe class DlssPath: IDisposable
 
 	public double GpuMs => this.upscaler?.GpuMs ?? 0;
 
+	/// <summary>Supersampling diagnostics: DLSS object textures, logical / allocated size and RenderTargetManager slot</summary>
+	public string TextureReport()
+	{
+		byte* postEffectManager = (byte*)PostEffectManager.Instance();
+		byte* renderTargetManager = (byte*)RenderTargetManager.Instance();
+		nint dlssObject = postEffectManager == null ? 0 : *(nint*)(postEffectManager + DlssObjectOffset);
+		if (dlssObject == 0 || renderTargetManager == null)
+			return "";
+
+		string report = "";
+		foreach ((string name, int offset) in new[] { ("color", 0x168), ("target", 0x170), ("output", 0x178) })
+		{
+			byte* texture = *(byte**)(dlssObject + offset);
+			if (texture == null)
+			{
+				report += $"{name}: null\n";
+				continue;
+			}
+
+			string slot = "";
+			for (int i = 0; i < 0x800; i += 8)
+			{
+				if (*(byte**)(renderTargetManager + i) == texture)
+					slot += $" RTM+0x{i:X}";
+			}
+
+			report += $"{name}: {*(uint*)(texture + 0x38)}x{*(uint*)(texture + 0x3C)} of {*(uint*)(texture + 0x40)}x{*(uint*)(texture + 0x44)}{slot}\n";
+		}
+
+		return report + $"RTM render size {*(uint*)(renderTargetManager + 0x428)}x{*(uint*)(renderTargetManager + 0x42C)}";
+	}
+
 	public static float Scale(UpscaleMode mode) => mode switch
 	{
 		UpscaleMode.NativeAa => 1.0f,
@@ -172,6 +217,8 @@ public unsafe class DlssPath: IDisposable
 		UpscaleMode.Balanced => 1.7f,
 		UpscaleMode.Performance => 2.0f,
 		UpscaleMode.UltraPerformance => 3.0f,
+		UpscaleMode.Supersample15 => 1.0f / 1.5f,
+		UpscaleMode.Supersample20 => 0.5f,
 		_ => 1.0f,
 	};
 
@@ -270,6 +317,8 @@ public unsafe class DlssPath: IDisposable
 		this.sharpen = this.configuration.Sharpening;
 		this.sharpness = this.configuration.Sharpness;
 		this.measure = this.configuration.ShowTimings;
+		this.supersample = Math.Max(1.0f, 1.0f / Scale(this.configuration.Mode));
+		this.RequestReallocation();
 
 		float wanted = Scale(this.configuration.Mode);
 		if (wanted != this.scale)
@@ -288,6 +337,8 @@ public unsafe class DlssPath: IDisposable
 	private void BeginRelease(string status)
 	{
 		GraphicsConfig.Instance()->GraphicsRezoUpscaleType = GameSettingIsFsr() ? UpscaleTypeFsr : UpscaleTypeDlss;
+		this.supersample = 1.0f;
+		this.RequestReallocation();
 		this.state = State.Releasing;
 		this.releaseFramesLeft = ReleaseFrames;
 		this.Status = status;
@@ -319,10 +370,24 @@ public unsafe class DlssPath: IDisposable
 		{
 			this.upscaler?.Dispose();
 			this.upscaler = null;
+			this.downsampler?.Dispose();
+			this.downsampler = null;
 		}
 
 		this.DisposeRetired();
 		this.state = State.Idle;
+	}
+
+	/// <summary>
+	/// Render resolution targets are only allocated on a device resize, request one at the same size
+	/// </summary>
+	private void RequestReallocation()
+	{
+		if (this.supersample == this.allocatedSupersample)
+			return;
+
+		this.allocatedSupersample = this.supersample;
+		*((byte*)Device.Instance() + DeviceResizePendingOffset) = 1;
 	}
 
 	private void SampleCamera()
@@ -351,6 +416,7 @@ public unsafe class DlssPath: IDisposable
 		Toggle(this.releaseHook, enable);
 		Toggle(this.destroyParametersHook, enable);
 		Toggle(this.shutdownHook, enable);
+		Toggle(this.renderSizeHook, enable);
 		this.hooksEnabled = enable;
 	}
 
@@ -372,11 +438,26 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
+	/// Display size times the supersampling factor, allocation and per frame size alike
+	/// </summary>
+	private void RenderSizeDetour(nint renderTargetManager, uint* size, byte allocate)
+	{
+		this.renderSizeHook!.Original(renderTargetManager, size, allocate);
+		float factor = this.supersample;
+		if (factor <= 1.0f)
+			return;
+
+		Device* device = Device.Instance();
+		size[0] = (uint)(device->Width * factor);
+		size[1] = (uint)(device->Height * factor);
+	}
+
+	/// <summary>
 	/// Render size for the configured mode, regardless of the DLSS quality
 	/// </summary>
 	private int OptimalSettings(nint _)
 	{
-		float currentScale = Math.Max(1.0f, this.scale);
+		float currentScale = this.scale > 0 ? this.scale : 1.0f;
 		double width = Math.Max(1, Math.Floor(this.parameters.Number("Width") / currentScale));
 		double height = Math.Max(1, Math.Floor(this.parameters.Number("Height") / currentScale));
 		this.parameters.SetNumber("OutWidth", width);
@@ -407,14 +488,24 @@ public unsafe class DlssPath: IDisposable
 		{
 			this.upscaler?.Dispose();
 			this.upscaler = null;
+			this.downsampler?.Dispose();
+			this.downsampler = null;
 		}
 
 		nint device = D3D11.GetDevice(context);
 		try
 		{
-			Fsr3Upscaler created = new(device, renderWidth, renderHeight, outputWidth, outputHeight);
+			// Supersampling: FSR at the render size, then down to the output
+			bool supersampling = renderWidth > outputWidth;
+			Fsr3Upscaler created = supersampling
+				? new Fsr3Upscaler(device, renderWidth, renderHeight, renderWidth, renderHeight)
+				: new Fsr3Upscaler(device, renderWidth, renderHeight, outputWidth, outputHeight);
+			Downsampler? createdDownsampler = supersampling ? new Downsampler(device, renderWidth, renderHeight) : null;
 			lock (this.upscalerLock)
+			{
 				this.upscaler = created;
+				this.downsampler = createdDownsampler;
+			}
 
 			this.RenderWidth = renderWidth;
 			this.RenderHeight = renderHeight;
@@ -448,8 +539,13 @@ public unsafe class DlssPath: IDisposable
 		this.lastEvaluate = now;
 
 		Fsr3Upscaler? current;
+		Downsampler? currentDownsampler;
 		lock (this.upscalerLock)
+		{
 			current = this.upscaler;
+			currentDownsampler = this.downsampler;
+		}
+
 
 		Fsr3Upscaler.DispatchParams dispatch = new()
 		{
@@ -484,10 +580,27 @@ public unsafe class DlssPath: IDisposable
 			dispatch.RenderHeight = current.MaxRenderHeight;
 		}
 
+		nint gameOutput = dispatch.Output;
+		if (currentDownsampler != null)
+		{
+			// Until the requested resize has run the game still renders at the display size
+			D3D11.Texture2DDesc colorDesc = D3D11.GetDesc(dispatch.Color);
+			if (colorDesc.Width < current.MaxRenderWidth || colorDesc.Height < current.MaxRenderHeight)
+			{
+				this.Status = $"Waiting for the render targets ({colorDesc.Width}x{colorDesc.Height} allocated)";
+				return NgxParameters.Fail;
+			}
+
+			D3D11.Texture2DDesc outputDesc = D3D11.GetDesc(gameOutput);
+			dispatch.Output = currentDownsampler.Intermediate;
+			this.Status = $"On (supersampling, output texture {outputDesc.Width}x{outputDesc.Height})";
+		}
+
 		try
 		{
 			long start = Stopwatch.GetTimestamp();
 			current.Dispatch(context, dispatch);
+			currentDownsampler?.Dispatch(context, dispatch.Output, current.UpscaleWidth, current.UpscaleHeight, gameOutput, this.OutputWidth, this.OutputHeight);
 			if (dispatch.Measure)
 			{
 				double ms = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
@@ -518,7 +631,10 @@ public unsafe class DlssPath: IDisposable
 		{
 			if (this.upscaler != null)
 				this.retired.Add(this.upscaler);
+			if (this.downsampler != null)
+				this.retired.Add(this.downsampler);
 			this.upscaler = null;
+			this.downsampler = null;
 		}
 
 		return NgxParameters.Success;
@@ -528,7 +644,7 @@ public unsafe class DlssPath: IDisposable
 	{
 		lock (this.upscalerLock)
 		{
-			foreach (Fsr3Upscaler old in this.retired)
+			foreach (IDisposable old in this.retired)
 				old.Dispose();
 			this.retired.Clear();
 		}
@@ -563,9 +679,12 @@ public unsafe class DlssPath: IDisposable
 		this.releaseHook?.Dispose();
 		this.destroyParametersHook?.Dispose();
 		this.shutdownHook?.Dispose();
+		this.renderSizeHook?.Dispose();
 
 		lock (this.upscalerLock)
 		{
+			this.downsampler?.Dispose();
+			this.downsampler = null;
 			this.upscaler?.Dispose();
 			this.upscaler = null;
 		}

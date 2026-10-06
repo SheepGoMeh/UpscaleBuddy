@@ -11,7 +11,7 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 	private static readonly string[] ModeNames =
 	[
 		"Off (game's own upscaler)", "Native AA (1.0x)", "Quality (1.5x)", "Balanced (1.7x)", "Performance (2.0x)",
-		"Ultra Performance (3.0x)",
+		"Ultra Performance (3.0x)", "Supersample 1.5x (experimental)", "Supersample 2.0x (experimental)",
 	];
 
 	public override void Draw()
@@ -44,6 +44,13 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			return;
 
 		ImGui.TextDisabled($"Rendering {dlssPath.RenderWidth}x{dlssPath.RenderHeight}, output {dlssPath.OutputWidth}x{dlssPath.OutputHeight}");
+		if (configuration.Mode is UpscaleMode.Supersample15 or UpscaleMode.Supersample20)
+		{
+			string report = dlssPath.TextureReport();
+			ImGui.TextDisabled(report);
+			if (ImGui.Button("Copy report"))
+				ImGui.SetClipboardText(dlssPath.Status + "\n" + report);
+		}
 		if (configuration.ShowTimings)
 			ImGui.TextDisabled($"FSR 3.1: CPU {dlssPath.CpuMs:F3} ms, GPU {dlssPath.GpuMs:F3} ms per frame");
 	}

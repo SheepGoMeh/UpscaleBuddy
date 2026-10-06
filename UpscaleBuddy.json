@@ -1,0 +1,10 @@
+{
+  "Author": "SheepGoMeh",
+  "Name": "UpscaleBuddy",
+  "InternalName": "UpscaleBuddy",
+  "Description": "Runs AMD FSR 3.1 temporal upscaling and anti-aliasing through the game's own DLSS path, on any GPU.\nSupports the FSR quality presets and Native AA.\nOpen the settings with /upscalebuddy",
+  "Punchline": "FSR 3.1 upscaling and anti-aliasing on any GPU.",
+  "Tags": ["Graphics", "Upscaling", "FSR", "Anti-aliasing"],
+  "ApplicableVersion": "any",
+  "IconUrl": "https://raw.githubusercontent.com/SheepGoMeh/UpscaleBuddy/main/images/icon.png"
+}

@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  shaders:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+          ref: v2.3.0
+          path: fidelityfx
+          sparse-checkout: Kits/FidelityFX
+
+      - name: Build shaders
+        shell: pwsh
+        run: ./Shaders/Build-Shaders.ps1 -Sdk fidelityfx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shaders
+          path: Shaders/Compiled
+          retention-days: 1
+
+  build:
+    needs: shaders
+    runs-on: ubuntu-latest
+    env:
+      DALAMUD_HOME: ${{ github.workspace }}/dalamud
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: shaders
+          path: Shaders/Compiled
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download Dalamud
+        run: |
+          curl -sSfL https://goatcorp.github.io/dalamud-distrib/latest.zip -o dalamud.zip
+          unzip -q dalamud.zip -d "$DALAMUD_HOME"
+
+      - name: Build
+        run: dotnet build -c Release -p:EnableWindowsTargeting=true -p:AssemblyVersion=${GITHUB_REF_NAME#v}
+
+      - name: Generate repo.json
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/latest.zip"
+          jq --arg url "$url" --arg repo "https://github.com/${GITHUB_REPOSITORY}" --argjson now "$(date +%s)" \
+            '[. + {RepoUrl: $repo, DownloadLinkInstall: $url, DownloadLinkUpdate: $url, DownloadLinkTesting: $url, LastUpdate: $now}]' \
+            bin/Release/UpscaleBuddy/UpscaleBuddy.json > repo.json
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/Release/UpscaleBuddy/latest.zip
+            repo.json
+          generate_release_notes: true

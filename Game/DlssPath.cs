@@ -281,8 +281,8 @@ public unsafe class DlssPath: IDisposable
 		this.savedFlags = (byte)(*(byte*)(dlssObject + StateFlagsOffset) & 3);
 		this.savedParameters = *(nint*)(dlssObject + ParametersOffset);
 		this.savedFeature = *(nint*)(dlssObject + FeatureOffset);
-		*(byte*)(dlssObject + StateFlagsOffset) &= 0xFC;
-		*(long*)(dlssObject + CachedOutputSizeOffset) = -1;
+		*(byte*)(dlssObject + StateFlagsOffset) &= 0xFE;
+		this.InvalidateFeature(); // The cached settings survive a plugin reload, without this the game never creates
 
 		this.savedRenderSizeCallback = *(nint*)(renderTargetManager + RenderSizeCallbackOffset);
 		*(nint*)(renderTargetManager + RenderSizeCallbackOffset) = this.renderSizeCallback;
@@ -376,6 +376,23 @@ public unsafe class DlssPath: IDisposable
 
 		this.DisposeRetired();
 		this.state = State.Idle;
+	}
+
+	/// <summary>
+	/// Same fields the game resets after releasing the feature (FUN_140373d10), the next frame creates it again
+	/// </summary>
+	private void InvalidateFeature()
+	{
+		nint dlssObject = *(nint*)((byte*)PostEffectManager.Instance() + DlssObjectOffset);
+		if (dlssObject == 0)
+			return;
+
+		*(byte*)(dlssObject + StateFlagsOffset) &= 0xFD;
+		*(long*)(dlssObject + 0xCC) = -1;
+		*(long*)(dlssObject + 0xD4) = -1;
+		*(int*)(dlssObject + 0xEC) = 1;
+		*(long*)(dlssObject + 0xF0) = 3;
+		*(long*)(dlssObject + CachedOutputSizeOffset) = -1;
 	}
 
 	/// <summary>

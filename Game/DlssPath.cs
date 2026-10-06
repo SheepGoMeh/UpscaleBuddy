@@ -31,18 +31,17 @@ public unsafe class DlssPath: IDisposable
 	private const string ShutdownSignature = "E8 ?? ?? ?? ?? 80 A3 ?? ?? ?? ?? ?? 48 8B 8B";
 
 	// From PostEffectManager setup (FUN_1403528a0), only done on DLSS capable GPUs
-	// Create: MemAlloc(0x188), ctor, PostEffectManager+0x4220, RenderTargetManager+0x730 = render size callback
-	// Teardown: FUN_140374610, FUN_140377790(object+0x90), FreeMemory(object, 0x188)
+	// MemAlloc(0x188), ctor, PostEffectManager+0x4220, RenderTargetManager+0x730 = render size callback
 	private const string MemAllocSignature = "E8 ?? ?? ?? ?? 48 8B F8 41 BE";
 	private const string DlssObjectCtorSignature = "E8 ?? ?? ?? ?? EB ?? 49 8B C7 48 89 87 ?? ?? ?? ?? 48 8D 0D";
 	private const string RenderSizeCallbackSignature = "48 8D 0D ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 89 88 ?? ?? ?? ?? 48 8B CF E8";
-	private const string TeardownSignature = "E8 ?? ?? ?? ?? 48 8D 8B ?? ?? ?? ?? E8 ?? ?? ?? ?? BA ?? ?? ?? ?? 48 8B CB E8 ?? ?? ?? ?? 4C 89 BF";
 	private const int DlssObjectSize = 0x188;
 	private const int DlssObjectOffset = 0x4220;
-	private const int RenderSizeTableOffset = 0x90;
 	private const int RenderSizeCallbackOffset = 0x730;
 	private const int CachedOutputSizeOffset = 0x150; // -1 makes the game query the render size again
 	private const int StateFlagsOffset = 0x181; // bit 0 NGX initialized, bit 1 feature created
+	private const int ParametersOffset = 0x158;
+	private const int FeatureOffset = 0x160;
 
 	private const byte UpscaleTypeFsr = 1;
 	private const byte UpscaleTypeDlss = 2;
@@ -76,9 +75,6 @@ public unsafe class DlssPath: IDisposable
 	private readonly Hook<HandleDelegate>? shutdownHook;
 	private readonly delegate* unmanaged<ulong, ulong, ulong, nint> memAlloc;
 	private readonly delegate* unmanaged<nint, nint> dlssObjectCtor;
-	private readonly delegate* unmanaged<nint, void> dlssObjectRelease;
-	private readonly delegate* unmanaged<nint, void> renderSizeTableDestroy;
-	private readonly delegate* unmanaged<nint, ulong, void> freeMemory;
 	private readonly nint renderSizeCallback;
 	private readonly nint featureHandle = System.Runtime.InteropServices.Marshal.AllocHGlobal(16);
 
@@ -102,7 +98,10 @@ public unsafe class DlssPath: IDisposable
 	// Framework thread
 	private State state = State.Idle;
 	private bool hooksEnabled;
-	private bool createdObject;
+	// NGX state of the DLSS object and the render size callback before activation
+	private byte savedFlags;
+	private nint savedParameters;
+	private nint savedFeature;
 	private nint savedRenderSizeCallback;
 	private int releaseFramesLeft;
 	private int rejections;
@@ -139,10 +138,6 @@ public unsafe class DlssPath: IDisposable
 			nint lea = Service.SigScanner.ScanText(RenderSizeCallbackSignature);
 			this.renderSizeCallback = lea + 7 + *(int*)(lea + 3);
 
-			nint teardown = Service.SigScanner.ScanModule(TeardownSignature);
-			this.dlssObjectRelease = (delegate* unmanaged<nint, void>)CallTarget(teardown);
-			this.renderSizeTableDestroy = (delegate* unmanaged<nint, void>)CallTarget(teardown + 12);
-			this.freeMemory = (delegate* unmanaged<nint, ulong, void>)CallTarget(teardown + 25);
 			this.Available = true;
 		}
 		catch (Exception e)
@@ -179,8 +174,6 @@ public unsafe class DlssPath: IDisposable
 		UpscaleMode.UltraPerformance => 3.0f,
 		_ => 1.0f,
 	};
-
-	private static nint CallTarget(nint call) => call + 5 + *(int*)(call + 1);
 
 	/// <summary>
 	/// Game setting for 3D resolution scaling
@@ -235,16 +228,14 @@ public unsafe class DlssPath: IDisposable
 				return;
 
 			*(nint*)(postEffectManager + DlssObjectOffset) = this.dlssObjectCtor(dlssObject);
-			this.createdObject = true;
 		}
-		else
-		{
-			// Game's own object on NVIDIA, shut down NGX before the hooks are enabled
-			if ((*(byte*)(dlssObject + StateFlagsOffset) & 1) != 0)
-				this.dlssObjectRelease(dlssObject);
-			*(byte*)(dlssObject + StateFlagsOffset) &= 0xFC;
-			*(long*)(dlssObject + CachedOutputSizeOffset) = -1;
-		}
+
+		// The game re-runs NGX init through the hooks, the previous state is put back on release
+		this.savedFlags = (byte)(*(byte*)(dlssObject + StateFlagsOffset) & 3);
+		this.savedParameters = *(nint*)(dlssObject + ParametersOffset);
+		this.savedFeature = *(nint*)(dlssObject + FeatureOffset);
+		*(byte*)(dlssObject + StateFlagsOffset) &= 0xFC;
+		*(long*)(dlssObject + CachedOutputSizeOffset) = -1;
 
 		this.savedRenderSizeCallback = *(nint*)(renderTargetManager + RenderSizeCallbackOffset);
 		*(nint*)(renderTargetManager + RenderSizeCallbackOffset) = this.renderSizeCallback;
@@ -292,7 +283,7 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Restores the game's upscaler, the DLSS object is torn down a few frames later
+	/// Restores the game's upscaler, the DLSS object state is restored a few frames later
 	/// </summary>
 	private void BeginRelease(string status)
 	{
@@ -308,23 +299,29 @@ public unsafe class DlssPath: IDisposable
 		byte* postEffectManager = (byte*)PostEffectManager.Instance();
 		byte* renderTargetManager = (byte*)RenderTargetManager.Instance();
 		nint dlssObject = postEffectManager == null ? 0 : *(nint*)(postEffectManager + DlssObjectOffset);
+
+		// Textures stay with the game, RenderTargetManager can still use the DLSS output as its final target
 		if (dlssObject != 0)
 		{
-			// NGX calls in here still go to the hooks
-			this.dlssObjectRelease(dlssObject);
-			if (this.createdObject)
-			{
-				this.renderSizeTableDestroy(dlssObject + RenderSizeTableOffset);
-				this.freeMemory(dlssObject, DlssObjectSize);
-				*(nint*)(postEffectManager + DlssObjectOffset) = 0;
-			}
+			*(byte*)(dlssObject + StateFlagsOffset) = (byte)((*(byte*)(dlssObject + StateFlagsOffset) & 0xFC) | this.savedFlags);
+			*(nint*)(dlssObject + ParametersOffset) = this.savedParameters;
+			*(nint*)(dlssObject + FeatureOffset) = this.savedFeature;
+			*(long*)(dlssObject + CachedOutputSizeOffset) = -1;
 		}
 
 		if (renderTargetManager != null)
 			*(nint*)(renderTargetManager + RenderSizeCallbackOffset) = this.savedRenderSizeCallback;
 
-		this.createdObject = false;
 		this.EnableHooks(false);
+
+		// No evaluate is queued anymore after the release frames
+		lock (this.upscalerLock)
+		{
+			this.upscaler?.Dispose();
+			this.upscaler = null;
+		}
+
+		this.DisposeRetired();
 		this.state = State.Idle;
 	}
 
@@ -547,7 +544,7 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Unload, tears down the DLSS object
+	/// Unload, restores the DLSS object state
 	/// </summary>
 	public void Finish()
 	{

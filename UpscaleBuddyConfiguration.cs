@@ -12,6 +12,8 @@ public enum UpscaleMode
 	UltraPerformance,
 	Supersample15,
 	Supersample20,
+	Supersample125,
+	Supersample175,
 }
 
 public class UpscaleBuddyConfiguration: IPluginConfiguration

@@ -43,6 +43,8 @@ public unsafe class DlssPath: IDisposable
 	private const int DlssObjectSize = 0x188;
 	private const int DlssObjectOffset = 0x4220;
 	private const int RenderSizeCallbackOffset = 0x730;
+	private const int RenderHeightOffset = 0x704; // RenderTargetManager, maximum render height
+	private const int DlssRenderHeightOffset = 0xE8; // DLSS object, height the render size callback returns
 	private const int CachedOutputSizeOffset = 0x150; // -1 makes the game query the render size again
 	private const int DeviceResizePendingOffset = 0x7A; // PostTick: release callbacks, swapchain resize, recreate callbacks
 	private const int StateFlagsOffset = 0x181; // bit 0 NGX initialized, bit 1 feature created
@@ -90,6 +92,7 @@ public unsafe class DlssPath: IDisposable
 	private volatile float scale = 1.0f;
 	private volatile float supersample = 1.0f;
 	private float allocatedSupersample = 1.0f;
+	private int requestedRenderHeight;
 	private volatile bool sharpen;
 	private volatile float sharpness;
 	private volatile bool measure;
@@ -178,38 +181,6 @@ public unsafe class DlssPath: IDisposable
 
 	public double GpuMs => this.upscaler?.GpuMs ?? 0;
 
-	/// <summary>Supersampling diagnostics: DLSS object textures, logical / allocated size and RenderTargetManager slot</summary>
-	public string TextureReport()
-	{
-		byte* postEffectManager = (byte*)PostEffectManager.Instance();
-		byte* renderTargetManager = (byte*)RenderTargetManager.Instance();
-		nint dlssObject = postEffectManager == null ? 0 : *(nint*)(postEffectManager + DlssObjectOffset);
-		if (dlssObject == 0 || renderTargetManager == null)
-			return "";
-
-		string report = "";
-		foreach ((string name, int offset) in new[] { ("color", 0x168), ("target", 0x170), ("output", 0x178) })
-		{
-			byte* texture = *(byte**)(dlssObject + offset);
-			if (texture == null)
-			{
-				report += $"{name}: null\n";
-				continue;
-			}
-
-			string slot = "";
-			for (int i = 0; i < 0x800; i += 8)
-			{
-				if (*(byte**)(renderTargetManager + i) == texture)
-					slot += $" RTM+0x{i:X}";
-			}
-
-			report += $"{name}: {*(uint*)(texture + 0x38)}x{*(uint*)(texture + 0x3C)} of {*(uint*)(texture + 0x40)}x{*(uint*)(texture + 0x44)}{slot}\n";
-		}
-
-		return report + $"RTM render size {*(uint*)(renderTargetManager + 0x428)}x{*(uint*)(renderTargetManager + 0x42C)}";
-	}
-
 	public static float Scale(UpscaleMode mode) => mode switch
 	{
 		UpscaleMode.NativeAa => 1.0f,
@@ -217,7 +188,9 @@ public unsafe class DlssPath: IDisposable
 		UpscaleMode.Balanced => 1.7f,
 		UpscaleMode.Performance => 2.0f,
 		UpscaleMode.UltraPerformance => 3.0f,
+		UpscaleMode.Supersample125 => 1.0f / 1.25f,
 		UpscaleMode.Supersample15 => 1.0f / 1.5f,
+		UpscaleMode.Supersample175 => 1.0f / 1.75f,
 		UpscaleMode.Supersample20 => 0.5f,
 		_ => 1.0f,
 	};
@@ -338,6 +311,8 @@ public unsafe class DlssPath: IDisposable
 	{
 		GraphicsConfig.Instance()->GraphicsRezoUpscaleType = GameSettingIsFsr() ? UpscaleTypeFsr : UpscaleTypeDlss;
 		this.supersample = 1.0f;
+		this.allocatedSupersample = 0; // Back to the game's render size
+		this.requestedRenderHeight = 0;
 		this.RequestReallocation();
 		this.state = State.Releasing;
 		this.releaseFramesLeft = ReleaseFrames;
@@ -400,10 +375,17 @@ public unsafe class DlssPath: IDisposable
 	/// </summary>
 	private void RequestReallocation()
 	{
-		if (this.supersample == this.allocatedSupersample)
+		// RenderTargetManager only reads the DLSS render size on a resize
+		nint dlssObject = *(nint*)((byte*)PostEffectManager.Instance() + DlssObjectOffset);
+		int renderHeight = dlssObject == 0 || this.supersample > 1.0f ? 0 : *(int*)(dlssObject + DlssRenderHeightOffset);
+		ushort usedHeight = *(ushort*)((byte*)RenderTargetManager.Instance() + RenderHeightOffset);
+		bool renderSizeStale = renderHeight > 0 && renderHeight != usedHeight && renderHeight != this.requestedRenderHeight;
+
+		if (this.supersample == this.allocatedSupersample && !renderSizeStale)
 			return;
 
 		this.allocatedSupersample = this.supersample;
+		this.requestedRenderHeight = renderHeight;
 		*((byte*)Device.Instance() + DeviceResizePendingOffset) = 1;
 	}
 

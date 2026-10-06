@@ -1,3 +1,5 @@
+using System;
+
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 
@@ -8,20 +10,29 @@ namespace UpscaleBuddy.Windows;
 public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlssPath)
 	: Window("UpscaleBuddy", ImGuiWindowFlags.AlwaysAutoResize)
 {
+	// Saved as the enum value, the list order is independent
+	private static readonly UpscaleMode[] Modes =
+	[
+		UpscaleMode.Off, UpscaleMode.NativeAa, UpscaleMode.Quality, UpscaleMode.Balanced, UpscaleMode.Performance,
+		UpscaleMode.UltraPerformance, UpscaleMode.Supersample125, UpscaleMode.Supersample15, UpscaleMode.Supersample175,
+		UpscaleMode.Supersample20,
+	];
+
 	private static readonly string[] ModeNames =
 	[
 		"Off (game's own upscaler)", "Native AA (1.0x)", "Quality (1.5x)", "Balanced (1.7x)", "Performance (2.0x)",
-		"Ultra Performance (3.0x)", "Supersample 1.5x (experimental)", "Supersample 2.0x (experimental)",
+		"Ultra Performance (3.0x)", "Supersample 1.25x (experimental)", "Supersample 1.5x (experimental)",
+		"Supersample 1.75x (experimental)", "Supersample 2.0x (experimental)",
 	];
 
 	public override void Draw()
 	{
 		ImGui.BeginDisabled(!dlssPath.Available);
 
-		int mode = (int)configuration.Mode;
+		int mode = Array.IndexOf(Modes, configuration.Mode);
 		if (ImGui.Combo("FSR 3.1 mode", ref mode, ModeNames, ModeNames.Length))
 		{
-			configuration.Mode = (UpscaleMode)mode;
+			configuration.Mode = Modes[mode];
 			configuration.Save();
 		}
 
@@ -44,13 +55,6 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			return;
 
 		ImGui.TextDisabled($"Rendering {dlssPath.RenderWidth}x{dlssPath.RenderHeight}, output {dlssPath.OutputWidth}x{dlssPath.OutputHeight}");
-		if (configuration.Mode is UpscaleMode.Supersample15 or UpscaleMode.Supersample20)
-		{
-			string report = dlssPath.TextureReport();
-			ImGui.TextDisabled(report);
-			if (ImGui.Button("Copy report"))
-				ImGui.SetClipboardText(dlssPath.Status + "\n" + report);
-		}
 		if (configuration.ShowTimings)
 			ImGui.TextDisabled($"FSR 3.1: CPU {dlssPath.CpuMs:F3} ms, GPU {dlssPath.GpuMs:F3} ms per frame");
 	}

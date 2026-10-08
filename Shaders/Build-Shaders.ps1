@@ -1,4 +1,4 @@
-# Compiles the FSR 3.1 upscaler passes for cs_5_0 into Shaders/Compiled
+# Compiles the FSR 3.1 upscaler passes for cs_5_0 into Shaders/Compiled, copies the FSR DLLs next to them
 # Usage: .\Build-Shaders.ps1 -Sdk <FidelityFX-SDK 2.x checkout>
 # Output: <pass>.cso and <pass>.txt with "<kind> <name> <slot>" bindings
 param(
@@ -75,8 +75,14 @@ foreach ($name in $passes.Keys) {
 }
 
 # Own shaders
-foreach ($name in @('downsample')) {
+foreach ($name in @('downsample', 'depth_copy')) {
 	& $Fxc /nologo /T cs_5_0 /E CS /O3 /Fo (Join-Path $out "$name.cso") (Join-Path $PSScriptRoot "$name.hlsl") | Where-Object { $_ -match 'error' }
 	if ($LASTEXITCODE -ne 0) { throw "fxc failed for $name" }
 	Write-Host "$name : built"
+}
+
+# AMD's signed FSR DLLs (FSR 4 on RDNA 4, FSR 3.1 elsewhere), loaded by Ffx/FfxUpscaler.cs
+foreach ($name in @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll')) {
+	Copy-Item (Join-Path $kit "signedbin\$name") $out
+	Write-Host "$name : copied"
 }

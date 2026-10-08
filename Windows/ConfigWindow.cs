@@ -30,11 +30,14 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		ImGui.BeginDisabled(!dlssPath.Available);
 
 		int mode = Array.IndexOf(Modes, configuration.Mode);
-		if (ImGui.Combo("FSR 3.1 mode", ref mode, ModeNames, ModeNames.Length))
+		if (ImGui.Combo("FSR mode", ref mode, ModeNames, ModeNames.Length))
 		{
 			configuration.Mode = Modes[mode];
 			configuration.Save();
 		}
+
+		if (ImGui.Checkbox("Use AMD's FSR DLL over D3D12 (FSR 4 on RDNA 4)", ref configuration.UseAmdDll))
+			configuration.Save();
 
 		if (ImGui.Checkbox("Sharpening (RCAS)", ref configuration.Sharpening))
 			configuration.Save();
@@ -56,6 +59,6 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 
 		ImGui.TextDisabled($"Rendering {dlssPath.RenderWidth}x{dlssPath.RenderHeight}, output {dlssPath.OutputWidth}x{dlssPath.OutputHeight}");
 		if (configuration.ShowTimings)
-			ImGui.TextDisabled($"FSR 3.1: CPU {dlssPath.CpuMs:F3} ms, GPU {dlssPath.GpuMs:F3} ms per frame");
+			ImGui.TextDisabled($"FSR per frame: CPU {dlssPath.CpuMs:F3} ms, {dlssPath.GpuTimings}");
 	}
 }

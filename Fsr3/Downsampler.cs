@@ -1,7 +1,11 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Runtime.InteropServices;
+
+using TerraFX.Interop.DirectX;
+using TerraFX.Interop.Windows;
+
+using static TerraFX.Interop.DirectX.DXGI_FORMAT;
 
 namespace UpscaleBuddy.Fsr3;
 
@@ -19,34 +23,33 @@ public unsafe class Downsampler: IDisposable
 		public uint Padding0, Padding1;
 	}
 
-	private readonly nint device;
-	private readonly nint shader;
-	private readonly nint constantBuffer;
-	private readonly nint sampler;
-	private readonly Dictionary<(nint, bool), nint> views = [];
+	private readonly ID3D11Device* device;
+	private readonly ID3D11ComputeShader* shader;
+	private readonly ID3D11Buffer* constantBuffer;
+	private readonly ID3D11SamplerState* sampler;
 
-	public Downsampler(nint device, uint width, uint height)
+	// Views by texture, they keep the textures alive so an address can't be reused
+	private readonly Dictionary<nint, nint> srvs = [];
+	private readonly Dictionary<nint, nint> uavs = [];
+
+	public Downsampler(ID3D11Device* device, uint width, uint height)
 	{
 		this.device = device;
-		this.Intermediate = D3D11.CreateTexture(device, width, height, D3D11.FormatR16G16B16A16Float, 1,
-			D3D11.BindShaderResource | D3D11.BindUnorderedAccess);
-		using Stream stream = typeof(Downsampler).Assembly.GetManifestResourceStream("Shaders.downsample.cso") ??
-		                      throw new InvalidOperationException("missing resource Shaders.downsample.cso");
-		using MemoryStream memory = new();
-		stream.CopyTo(memory);
-		this.shader = D3D11.CreateComputeShader(device, memory.ToArray());
-		this.constantBuffer = D3D11.CreateConstantBuffer(device, (uint)sizeof(Constants));
-		this.sampler = D3D11.CreateSampler(device, true);
+		this.Intermediate = Dx.CreateTexture(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, Dx.BindShaderResourceAndUav);
+		this.shader = Dx.CreateComputeShader(device, "Shaders.downsample.cso");
+		this.constantBuffer = Dx.CreateConstantBuffer(device, (uint)sizeof(Constants));
+		this.sampler = Dx.CreateSampler(device, true);
 	}
 
 	/// <summary>FSR output at the supersampled size</summary>
-	public nint Intermediate { get; }
+	public ID3D11Texture2D* Intermediate { get; }
 
 	/// <summary>Render thread, output size is the used region, the texture can be allocated larger</summary>
-	public void Dispatch(nint context, nint color, uint renderWidth, uint renderHeight, nint output, uint outputWidth, uint outputHeight)
+	public void Dispatch(ID3D11DeviceContext* context, ID3D11Texture2D* color, uint renderWidth, uint renderHeight, ID3D11Texture2D* output,
+		uint outputWidth, uint outputHeight)
 	{
-		D3D11.Texture2DDesc colorDesc = D3D11.GetDesc(color);
-		D3D11.Texture2DDesc outputDesc = D3D11.GetDesc(output);
+		D3D11_TEXTURE2D_DESC colorDesc = Dx.GetDesc(color);
+		D3D11_TEXTURE2D_DESC outputDesc = Dx.GetDesc(output);
 		Constants constants = new()
 		{
 			SourceScaleX = renderWidth / (float)colorDesc.Width,
@@ -56,45 +59,44 @@ public unsafe class Downsampler: IDisposable
 			OutputWidth = outputWidth,
 			OutputHeight = outputHeight,
 		};
-		D3D11.Upload(context, this.constantBuffer, constants);
+		Dx.Upload(context, this.constantBuffer, constants);
 
-		nint* srv = stackalloc nint[1] { this.View(color, false, colorDesc.Format) };
-		nint* uav = stackalloc nint[1] { this.View(output, true, outputDesc.Format) };
-		nint* buffer = stackalloc nint[1] { this.constantBuffer };
-		nint* samplers = stackalloc nint[2] { 0, this.sampler };
-		nint* none = stackalloc nint[1] { 0 };
+		if (!this.srvs.TryGetValue((nint)color, out nint srvView))
+			this.srvs[(nint)color] = srvView = (nint)Dx.CreateSrv(this.device, color, colorDesc.Format);
+		if (!this.uavs.TryGetValue((nint)output, out nint uavView))
+			this.uavs[(nint)output] = uavView = (nint)Dx.CreateUav(this.device, output, outputDesc.Format);
 
-		D3D11.SetShaderResources(context, srv, 1);
-		D3D11.SetUnorderedAccessViews(context, uav, 1);
-		D3D11.SetConstantBuffers(context, buffer, 1);
-		D3D11.SetSamplers(context, samplers, 2);
-		D3D11.SetShader(context, this.shader);
-		D3D11.Dispatch(context, (outputWidth + 7) / 8, (outputHeight + 7) / 8);
+		ID3D11ShaderResourceView* srv = (ID3D11ShaderResourceView*)srvView;
+		ID3D11UnorderedAccessView* uav = (ID3D11UnorderedAccessView*)uavView;
+		ID3D11Buffer* buffer = this.constantBuffer;
+		ID3D11SamplerState** samplers = stackalloc ID3D11SamplerState*[2] { null, this.sampler };
+		ID3D11ShaderResourceView* noSrv = null;
+		ID3D11UnorderedAccessView* noUav = null;
 
-		D3D11.SetUnorderedAccessViews(context, none, 1);
-		D3D11.SetShaderResources(context, none, 1);
-		D3D11.SetShader(context, 0);
-	}
+		context->CSSetShaderResources(0, 1, &srv);
+		context->CSSetUnorderedAccessViews(0, 1, &uav, null);
+		context->CSSetConstantBuffers(0, 1, &buffer);
+		context->CSSetSamplers(0, 2, samplers);
+		context->CSSetShader(this.shader, null, 0);
+		context->Dispatch((outputWidth + 7) / 8, (outputHeight + 7) / 8, 1);
 
-	private nint View(nint texture, bool unordered, uint format)
-	{
-		if (this.views.TryGetValue((texture, unordered), out nint view))
-			return view;
-
-		view = unordered ? D3D11.CreateUav(this.device, texture, format) : D3D11.CreateSrv(this.device, texture, format);
-		this.views[(texture, unordered)] = view;
-		return view;
+		context->CSSetUnorderedAccessViews(0, 1, &noUav, null);
+		context->CSSetShaderResources(0, 1, &noSrv);
+		context->CSSetShader(null, null, 0);
 	}
 
 	public void Dispose()
 	{
-		foreach (nint view in this.views.Values)
-			D3D11.Release(view);
-		this.views.Clear();
-		D3D11.Release(this.shader);
-		D3D11.Release(this.constantBuffer);
-		D3D11.Release(this.sampler);
-		D3D11.Release(this.Intermediate);
+		foreach (nint view in this.srvs.Values)
+			Dx.Release((IUnknown*)view);
+		foreach (nint view in this.uavs.Values)
+			Dx.Release((IUnknown*)view);
+		this.srvs.Clear();
+		this.uavs.Clear();
+		Dx.Release(this.shader);
+		Dx.Release(this.constantBuffer);
+		Dx.Release(this.sampler);
+		Dx.Release(this.Intermediate);
 		GC.SuppressFinalize(this);
 	}
 }

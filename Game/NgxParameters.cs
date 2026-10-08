@@ -38,7 +38,8 @@ public unsafe class NgxParameters: IDisposable
 
 	public NgxParameters()
 	{
-		// Never freed, the game can keep the pointer after unload
+		// The game only reaches it through the DLSS object (+0x158, read at each use, never copied), which DlssPath restores
+		// before disposing this
 		this.Address = Marshal.AllocHGlobal(8 + (SlotCount * 8));
 		this.vtable = (nint*)(this.Address + 8);
 		*(nint*)this.Address = (nint)this.vtable;
@@ -118,24 +119,10 @@ public unsafe class NgxParameters: IDisposable
 		return Success;
 	}
 
-	[DllImport("kernel32.dll")] private static extern nint VirtualAlloc(nint address, nuint size, uint type, uint protect);
-
-	/// <summary>
-	/// Points every slot at a native stub returning NGX failure
-	/// </summary>
 	public void Dispose()
 	{
-		nint stub = VirtualAlloc(0, 16, 0x3000 /* COMMIT | RESERVE */, 0x40 /* EXECUTE_READWRITE */);
-		if (stub != 0)
-		{
-			byte* code = (byte*)stub; // mov eax, 0xBAD00000; ret
-			code[0] = 0xB8;
-			*(uint*)(code + 1) = 0xBAD00000;
-			code[5] = 0xC3;
-			for (int i = 0; i < SlotCount; i++)
-				this.vtable[i] = stub;
-		}
-
+		Marshal.FreeHGlobal(this.Address);
+		this.keepAlive.Clear();
 		GC.SuppressFinalize(this);
 	}
 }

@@ -24,6 +24,7 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	public bool Sharpening = true;
 	public float Sharpness = 0.5f;
 	public bool ShowTimings;
+	public bool UseAmdDll;
 
 	public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }

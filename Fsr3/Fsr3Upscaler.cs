@@ -3,20 +3,26 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 
+using TerraFX.Interop.DirectX;
+using TerraFX.Interop.Windows;
+
+using static TerraFX.Interop.DirectX.D3D11_BIND_FLAG;
+using static TerraFX.Interop.DirectX.DXGI_FORMAT;
+
 namespace UpscaleBuddy.Fsr3;
 
 /// <summary>
 /// FSR 3.1 upscaler on D3D11, port of ffx_fsr3upscaler.cpp from the FidelityFX SDK (MIT)
 /// Shaders built by Shaders/Build-Shaders.ps1 for LDR color, inverted depth and low resolution motion vectors
 /// </summary>
-public unsafe class Fsr3Upscaler: IDisposable
+public unsafe class Fsr3Upscaler: IUpscaler
 {
 	public struct DispatchParams
 	{
-		public nint Color;
-		public nint Depth;
-		public nint MotionVectors;
-		public nint Output;
+		public ID3D11Texture2D* Color;
+		public ID3D11Texture2D* Depth;
+		public ID3D11Texture2D* MotionVectors;
+		public ID3D11Texture2D* Output;
 		public uint RenderWidth;
 		public uint RenderHeight;
 		public float JitterX;
@@ -78,31 +84,39 @@ public unsafe class Fsr3Upscaler: IDisposable
 		public uint Config0, Config1, Config2, Config3;
 	}
 
-	private sealed class Texture(nint texture, nint srv, nint uav)
+	private sealed class Texture(ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav)
 	{
-		public readonly nint Resource = texture;
-		public readonly nint Srv = srv;
-		public readonly nint Uav = uav;
+		public readonly ID3D11ShaderResourceView* Srv = srv;
+		public readonly ID3D11UnorderedAccessView* Uav = uav;
 	}
 
-	private sealed class Pass(nint shader, List<(string Kind, string Name, uint Slot)> bindings)
+	private sealed class Pass(ID3D11ComputeShader* shader, List<(string Kind, string Name, uint Slot)> bindings)
 	{
-		public readonly nint Shader = shader;
+		public readonly ID3D11ComputeShader* Shader = shader;
 		public readonly List<(string Kind, string Name, uint Slot)> Bindings = bindings;
 	}
+
+	private delegate ID3D11ShaderResourceView* SrvLookup(string name);
+
+	private delegate ID3D11UnorderedAccessView* UavLookup(string name);
 
 	private const int MaxQueuedFrames = 16;
 	private const float FltEpsilon = 1.1920929e-7f;
 	private const int SpdUavMips = 6;
 
-	private readonly nint device;
+	private readonly ID3D11Device* device;
 	private readonly uint maxRenderWidth;
 	private readonly uint maxRenderHeight;
 	private readonly uint upscaleWidth;
 	private readonly uint upscaleHeight;
+
+	// Released on dispose, as IUnknown*
 	private readonly List<nint> owned = [];
 	private readonly Dictionary<string, Pass> passes = [];
-	private readonly Dictionary<(nint, bool), nint> inputViews = [];
+
+	// Views on the game's textures by texture, they keep the textures alive so an address can't be reused
+	private readonly Dictionary<nint, nint> inputSrvs = [];
+	private readonly Dictionary<nint, nint> inputUavs = [];
 
 	private readonly Texture[] accumulation = new Texture[2];
 	private readonly Texture[] luma = new Texture[2];
@@ -112,7 +126,7 @@ public unsafe class Fsr3Upscaler: IDisposable
 	private readonly Texture shadingChange;
 	private readonly Texture newLocks;
 	private readonly Texture spdMips;
-	private readonly nint[] spdMipUavs = new nint[SpdUavMips];
+	private readonly ID3D11UnorderedAccessView*[] spdMipUavs = new ID3D11UnorderedAccessView*[SpdUavMips];
 	private readonly Texture farthestDepthMip1;
 	private readonly Texture spdAtomic;
 	private readonly Texture dilatedReactiveMasks;
@@ -123,25 +137,19 @@ public unsafe class Fsr3Upscaler: IDisposable
 	private readonly Texture dilatedDepth;
 	private readonly Texture dilatedMotionVectors;
 	private readonly Texture reconstructedPreviousDepth;
-	private readonly nint constantBuffer;
-	private readonly nint spdBuffer;
-	private readonly nint rcasBuffer;
-	private readonly nint[] samplers = new nint[2];
+	private readonly ID3D11Buffer* constantBuffer;
+	private readonly ID3D11Buffer* spdBuffer;
+	private readonly ID3D11Buffer* rcasBuffer;
+	private readonly ID3D11SamplerState*[] samplers = new ID3D11SamplerState*[2];
 
-	// Disjoint, begin, end per slot
-	private const int TimingSlots = 4;
-	private readonly nint[,] timing = new nint[TimingSlots, 3];
-	private readonly bool[] timingPending = new bool[TimingSlots];
-	private int timingSlot;
-
-	public double GpuMs { get; private set; }
+	private readonly GpuTimer timer;
 
 	private Constants constants;
 	private bool firstExecution = true;
 	private uint resourceFrameIndex;
 	private float preExposure;
 
-	public Fsr3Upscaler(nint device, uint maxRenderWidth, uint maxRenderHeight, uint upscaleWidth, uint upscaleHeight)
+	public Fsr3Upscaler(ID3D11Device* device, uint maxRenderWidth, uint maxRenderHeight, uint upscaleWidth, uint upscaleHeight)
 	{
 		this.device = device;
 		this.maxRenderWidth = maxRenderWidth;
@@ -163,53 +171,48 @@ public unsafe class Fsr3Upscaler: IDisposable
 			uint rw = maxRenderWidth, rh = maxRenderHeight, uw = upscaleWidth, uh = upscaleHeight;
 			for (int i = 0; i < 2; i++)
 			{
-				this.accumulation[i] = this.Create(rw, rh, D3D11.FormatR8Unorm);
-				this.luma[i] = this.Create(rw, rh, D3D11.FormatR16Float);
-				this.upscaled[i] = this.Create(uw, uh, D3D11.FormatR16G16B16A16Float);
-				this.lumaHistory[i] = this.Create(rw, rh, D3D11.FormatR16G16B16A16Float);
+				this.accumulation[i] = this.Create(rw, rh, DXGI_FORMAT_R8_UNORM);
+				this.luma[i] = this.Create(rw, rh, DXGI_FORMAT_R16_FLOAT);
+				this.upscaled[i] = this.Create(uw, uh, DXGI_FORMAT_R16G16B16A16_FLOAT);
+				this.lumaHistory[i] = this.Create(rw, rh, DXGI_FORMAT_R16G16B16A16_FLOAT);
 			}
 
-			this.intermediate = this.Create(rw, rh, D3D11.FormatR16Float);
-			this.shadingChange = this.Create(rw / 2, rh / 2, D3D11.FormatR8Unorm);
-			this.newLocks = this.Create(uw, uh, D3D11.FormatR8Unorm);
-			this.farthestDepthMip1 = this.Create(rw / 2, rh / 2, D3D11.FormatR16Float);
-			this.spdAtomic = this.Create(1, 1, D3D11.FormatR32Uint);
-			this.dilatedReactiveMasks = this.Create(rw, rh, D3D11.FormatR8G8B8A8Unorm);
-			this.frameInfo = this.Create(1, 1, D3D11.FormatR32G32B32A32Float);
-			this.dilatedDepth = this.Create(rw, rh, D3D11.FormatR32Float);
-			this.dilatedMotionVectors = this.Create(rw, rh, D3D11.FormatR16G16Float);
-			this.reconstructedPreviousDepth = this.Create(rw, rh, D3D11.FormatR32Uint);
+			this.intermediate = this.Create(rw, rh, DXGI_FORMAT_R16_FLOAT);
+			this.shadingChange = this.Create(rw / 2, rh / 2, DXGI_FORMAT_R8_UNORM);
+			this.newLocks = this.Create(uw, uh, DXGI_FORMAT_R8_UNORM);
+			this.farthestDepthMip1 = this.Create(rw / 2, rh / 2, DXGI_FORMAT_R16_FLOAT);
+			this.spdAtomic = this.Create(1, 1, DXGI_FORMAT_R32_UINT);
+			this.dilatedReactiveMasks = this.Create(rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM);
+			this.frameInfo = this.Create(1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT);
+			this.dilatedDepth = this.Create(rw, rh, DXGI_FORMAT_R32_FLOAT);
+			this.dilatedMotionVectors = this.Create(rw, rh, DXGI_FORMAT_R16G16_FLOAT);
+			this.reconstructedPreviousDepth = this.Create(rw, rh, DXGI_FORMAT_R32_UINT);
 
 			// Full mip chain, passes write mips 0-5
 			uint spdWidth = Math.Max(1, rw / 2), spdHeight = Math.Max(1, rh / 2);
 			uint spdMipCount = (uint)Math.Floor(Math.Log2(Math.Max(spdWidth, spdHeight))) + 1;
-			nint spdTexture = this.Own(D3D11.CreateTexture(device, spdWidth, spdHeight, D3D11.FormatR16G16Float, spdMipCount,
-				D3D11.BindShaderResource | D3D11.BindUnorderedAccess));
-			this.spdMips = new Texture(spdTexture, this.Own(D3D11.CreateSrv(device, spdTexture)), 0);
+			ID3D11Texture2D* spdTexture = this.Own(Dx.CreateTexture(device, spdWidth, spdHeight, DXGI_FORMAT_R16G16_FLOAT, spdMipCount,
+				Dx.BindShaderResourceAndUav));
+			this.spdMips = new Texture(this.Own(Dx.CreateSrv(device, spdTexture)), null);
 			for (uint mip = 0; mip < SpdUavMips; mip++)
-				this.spdMipUavs[mip] = this.Own(D3D11.CreateUav(device, spdTexture, D3D11.FormatR16G16Float, Math.Min(mip, spdMipCount - 1)));
+				this.spdMipUavs[mip] = this.Own(Dx.CreateUav(device, spdTexture, DXGI_FORMAT_R16G16_FLOAT, Math.Min(mip, spdMipCount - 1)));
 
 			short* lut = stackalloc short[128];
 			for (int i = 0; i < 128; i++)
 				lut[i] = (short)Math.Round(Lanczos2(2.0f * i / 127.0f) * 32767.0f);
-			this.lanczosLut = this.CreateReadOnly(128, D3D11.FormatR16Snorm, lut, 256);
+			this.lanczosLut = this.CreateReadOnly(128, DXGI_FORMAT_R16_SNORM, lut, 256);
 
 			byte reactivity = 0;
-			this.defaultReactivity = this.CreateReadOnly(1, D3D11.FormatR8Unorm, &reactivity, 1);
+			this.defaultReactivity = this.CreateReadOnly(1, DXGI_FORMAT_R8_UNORM, &reactivity, 1);
 			float* exposure = stackalloc float[2] { 0, 0 };
-			this.defaultExposure = this.CreateReadOnly(1, D3D11.FormatR32G32Float, exposure, 8);
+			this.defaultExposure = this.CreateReadOnly(1, DXGI_FORMAT_R32G32_FLOAT, exposure, 8);
 
-			this.constantBuffer = this.Own(D3D11.CreateConstantBuffer(device, (uint)sizeof(Constants)));
-			this.spdBuffer = this.Own(D3D11.CreateConstantBuffer(device, (uint)sizeof(SpdConstants)));
-			this.rcasBuffer = this.Own(D3D11.CreateConstantBuffer(device, (uint)sizeof(RcasConstants)));
-			this.samplers[0] = this.Own(D3D11.CreateSampler(device, false));
-			this.samplers[1] = this.Own(D3D11.CreateSampler(device, true));
-			for (int i = 0; i < TimingSlots; i++)
-			{
-				this.timing[i, 0] = this.Own(D3D11.CreateQuery(device, 3)); // TIMESTAMP_DISJOINT
-				this.timing[i, 1] = this.Own(D3D11.CreateQuery(device, 2)); // TIMESTAMP
-				this.timing[i, 2] = this.Own(D3D11.CreateQuery(device, 2));
-			}
+			this.constantBuffer = this.Own(Dx.CreateConstantBuffer(device, (uint)sizeof(Constants)));
+			this.spdBuffer = this.Own(Dx.CreateConstantBuffer(device, (uint)sizeof(SpdConstants)));
+			this.rcasBuffer = this.Own(Dx.CreateConstantBuffer(device, (uint)sizeof(RcasConstants)));
+			this.samplers[0] = this.Own(Dx.CreateSampler(device, false));
+			this.samplers[1] = this.Own(Dx.CreateSampler(device, true));
+			this.timer = new GpuTimer(device, 2);
 		}
 		catch
 		{
@@ -226,6 +229,10 @@ public unsafe class Fsr3Upscaler: IDisposable
 		this.constants.MinDisocclusionAccumulation = -1.0f / 3.0f;
 	}
 
+	public string Name => "FSR 3.1 (built-in)";
+
+	public string Timings => $"GPU {this.timer.Ms[0]:F3} ms";
+
 	public uint MaxRenderWidth => this.maxRenderWidth;
 
 	public uint MaxRenderHeight => this.maxRenderHeight;
@@ -237,27 +244,20 @@ public unsafe class Fsr3Upscaler: IDisposable
 	/// <summary>
 	/// Render thread, follows fsr3upscalerDispatch
 	/// </summary>
-	public void Dispatch(nint context, in DispatchParams p)
+	public void Dispatch(ID3D11DeviceContext* context, in DispatchParams p)
 	{
-		this.timingSlot = (this.timingSlot + 1) % TimingSlots;
-		int slot = this.timingSlot;
-		if (this.timingPending[slot])
-			this.ReadTiming(context, slot);
 		if (p.Measure)
-		{
-			D3D11.Begin(context, this.timing[slot, 0]);
-			D3D11.End(context, this.timing[slot, 1]);
-		}
+			this.timer.Begin(context);
 
-		nint color = this.InputView(p.Color, false);
-		nint depth = this.InputView(p.Depth, false);
-		nint motionVectors = this.InputView(p.MotionVectors, false);
-		nint output = this.InputView(p.Output, true);
+		ID3D11ShaderResourceView* color = this.InputSrv(p.Color);
+		ID3D11ShaderResourceView* depth = this.InputSrv(p.Depth);
+		ID3D11ShaderResourceView* motionVectors = this.InputSrv(p.MotionVectors);
+		ID3D11UnorderedAccessView* output = this.InputUav(p.Output);
 
 		if (this.firstExecution)
 		{
 			foreach (Texture texture in new[] { this.accumulation[0], this.accumulation[1], this.luma[0], this.luma[1] })
-				D3D11.ClearFloat(context, texture.Uav, 0);
+				ClearFloat(context, texture.Uav, 0);
 		}
 
 		bool odd = (this.resourceFrameIndex & 1) != 0;
@@ -270,16 +270,16 @@ public unsafe class Fsr3Upscaler: IDisposable
 
 		if (reset)
 		{
-			D3D11.ClearFloat(context, this.accumulation[srvIndex].Uav, 0);
-			foreach (nint mip in this.spdMipUavs)
-				D3D11.ClearFloat(context, mip, 0);
-			D3D11.ClearFloat(context, this.frameInfo.Uav, -1, 1);
+			ClearFloat(context, this.accumulation[srvIndex].Uav, 0);
+			foreach (ID3D11UnorderedAccessView* mip in this.spdMipUavs)
+				ClearFloat(context, mip, 0);
+			ClearFloat(context, this.frameInfo.Uav, -1, 1);
 		}
 
-		D3D11.ClearUint(context, this.reconstructedPreviousDepth.Uav, 0); // Inverted depth
-		D3D11.ClearUint(context, this.spdAtomic.Uav, 0);
-		foreach (nint mip in this.spdMipUavs)
-			D3D11.ClearFloat(context, mip, 0);
+		ClearUint(context, this.reconstructedPreviousDepth.Uav, 0); // Inverted depth
+		ClearUint(context, this.spdAtomic.Uav, 0);
+		foreach (ID3D11UnorderedAccessView* mip in this.spdMipUavs)
+			ClearFloat(context, mip, 0);
 
 		SpdSetup(p.RenderWidth, p.RenderHeight, out uint spdGroupsX, out uint spdGroupsY, out SpdConstants spd);
 		float sharpness = MathF.Pow(2.0f, -((-2.0f * p.Sharpness) + 2.0f));
@@ -289,13 +289,13 @@ public unsafe class Fsr3Upscaler: IDisposable
 			Config1 = (uint)BitConverter.HalfToUInt16Bits((Half)sharpness) * 0x10001u,
 		};
 
-		D3D11.Upload(context, this.constantBuffer, this.constants);
-		D3D11.Upload(context, this.spdBuffer, spd);
-		D3D11.Upload(context, this.rcasBuffer, rcas);
+		Dx.Upload(context, this.constantBuffer, this.constants);
+		Dx.Upload(context, this.spdBuffer, spd);
+		Dx.Upload(context, this.rcasBuffer, rcas);
 
 		int currentLuma = odd ? 1 : 0;
 		int previousLuma = odd ? 0 : 1;
-		nint Srv(string name) => name switch
+		ID3D11ShaderResourceView* Srv(string name) => name switch
 		{
 			"r_input_color_jittered" => color,
 			"r_input_motion_vectors" => motionVectors,
@@ -321,7 +321,7 @@ public unsafe class Fsr3Upscaler: IDisposable
 			"r_frame_info" => this.frameInfo.Srv,
 			_ => throw new InvalidOperationException($"unknown SRV {name}"),
 		};
-		nint Uav(string name) => name switch
+		ID3D11UnorderedAccessView* Uav(string name) => name switch
 		{
 			"rw_reconstructed_previous_nearest_depth" => this.reconstructedPreviousDepth.Uav,
 			"rw_dilated_motion_vectors" => this.dilatedMotionVectors.Uav,
@@ -360,23 +360,11 @@ public unsafe class Fsr3Upscaler: IDisposable
 		Unbind(context);
 		if (p.Measure)
 		{
-			D3D11.End(context, this.timing[slot, 2]);
-			D3D11.End(context, this.timing[slot, 0]);
-			this.timingPending[slot] = true;
+			this.timer.Mark(context, 1);
+			this.timer.End(context);
 		}
+
 		this.resourceFrameIndex = (this.resourceFrameIndex + 1) % MaxQueuedFrames;
-	}
-
-	private void ReadTiming(nint context, int slot)
-	{
-		ulong* disjoint = stackalloc ulong[2];
-		ulong begin, end;
-		if (!D3D11.GetData(context, this.timing[slot, 0], disjoint, 16) || ((uint*)disjoint)[2] != 0 ||
-		    !D3D11.GetData(context, this.timing[slot, 1], &begin, 8) || !D3D11.GetData(context, this.timing[slot, 2], &end, 8))
-			return;
-
-		this.timingPending[slot] = false;
-		this.GpuMs = (this.GpuMs * 0.9) + ((end - begin) * 1000.0 / disjoint[0] * 0.1);
 	}
 
 	private void UpdateConstants(in DispatchParams p, bool reset)
@@ -436,25 +424,19 @@ public unsafe class Fsr3Upscaler: IDisposable
 		c.FrameIndex = reset ? 0.0f : c.FrameIndex + 1.0f;
 	}
 
-	private void Run(nint context, string passName, uint x, uint y, Func<string, nint> srv, Func<string, nint> uav)
+	private void Run(ID3D11DeviceContext* context, string passName, uint x, uint y, SrvLookup srv, UavLookup uav)
 	{
 		Pass pass = this.passes[passName];
-		nint* srvs = stackalloc nint[16];
-		nint* uavs = stackalloc nint[16];
-		nint* buffers = stackalloc nint[4];
-		uint srvCount = 0, uavCount = 0, bufferCount = 0;
-		for (int i = 0; i < 16; i++)
-			srvs[i] = uavs[i] = 0;
-		for (int i = 0; i < 4; i++)
-			buffers[i] = 0;
-
+		ID3D11ShaderResourceView** srvs = stackalloc ID3D11ShaderResourceView*[16];
+		ID3D11UnorderedAccessView** uavs = stackalloc ID3D11UnorderedAccessView*[16];
+		ID3D11Buffer** buffers = stackalloc ID3D11Buffer*[4];
+		uint uavCount = 0, bufferCount = 0;
 		foreach ((string kind, string name, uint slot) in pass.Bindings)
 		{
 			switch (kind)
 			{
 				case "srv":
 					srvs[slot] = srv(name);
-					srvCount = Math.Max(srvCount, slot + 1);
 					break;
 				case "uav":
 					uavs[slot] = uav(name);
@@ -468,28 +450,38 @@ public unsafe class Fsr3Upscaler: IDisposable
 		}
 
 		// Unbind the previous outputs before using them as inputs
-		nint* none = stackalloc nint[16];
-		for (int i = 0; i < 16; i++)
-			none[i] = 0;
-		D3D11.SetUnorderedAccessViews(context, none, 16);
-		D3D11.SetShaderResources(context, srvs, 16);
-		D3D11.SetUnorderedAccessViews(context, uavs, Math.Max(uavCount, 1));
-		D3D11.SetConstantBuffers(context, buffers, bufferCount);
-		fixed (nint* sampler = this.samplers)
-			D3D11.SetSamplers(context, sampler, 2);
-		D3D11.SetShader(context, pass.Shader);
-		D3D11.Dispatch(context, x, y);
+		ID3D11UnorderedAccessView** noUavs = stackalloc ID3D11UnorderedAccessView*[16];
+		context->CSSetUnorderedAccessViews(0, 16, noUavs, null);
+		context->CSSetShaderResources(0, 16, srvs);
+		context->CSSetUnorderedAccessViews(0, Math.Max(uavCount, 1), uavs, null);
+		context->CSSetConstantBuffers(0, bufferCount, buffers);
+		fixed (ID3D11SamplerState** samplerStates = this.samplers)
+			context->CSSetSamplers(0, 2, samplerStates);
+		context->CSSetShader(pass.Shader, null, 0);
+		context->Dispatch(Math.Max(1, x), Math.Max(1, y), 1);
 	}
 
-	private static void Unbind(nint context)
+	private static void Unbind(ID3D11DeviceContext* context)
 	{
-		nint* none = stackalloc nint[16];
-		for (int i = 0; i < 16; i++)
-			none[i] = 0;
-		D3D11.SetUnorderedAccessViews(context, none, 16);
-		D3D11.SetShaderResources(context, none, 16);
-		D3D11.SetConstantBuffers(context, none, 4);
-		D3D11.SetShader(context, 0);
+		ID3D11UnorderedAccessView** noUavs = stackalloc ID3D11UnorderedAccessView*[16];
+		ID3D11ShaderResourceView** noSrvs = stackalloc ID3D11ShaderResourceView*[16];
+		ID3D11Buffer** noBuffers = stackalloc ID3D11Buffer*[4];
+		context->CSSetUnorderedAccessViews(0, 16, noUavs, null);
+		context->CSSetShaderResources(0, 16, noSrvs);
+		context->CSSetConstantBuffers(0, 4, noBuffers);
+		context->CSSetShader(null, null, 0);
+	}
+
+	private static void ClearFloat(ID3D11DeviceContext* context, ID3D11UnorderedAccessView* uav, float x, float y = 0)
+	{
+		float* values = stackalloc float[4] { x, y, 0, 0 };
+		context->ClearUnorderedAccessViewFloat(uav, values);
+	}
+
+	private static void ClearUint(ID3D11DeviceContext* context, ID3D11UnorderedAccessView* uav, uint value)
+	{
+		uint* values = stackalloc uint[4] { value, value, value, value };
+		context->ClearUnorderedAccessViewUint(uav, values);
 	}
 
 	/// <summary>ffxSpdSetup for (0, 0, width, height)</summary>
@@ -509,47 +501,50 @@ public unsafe class Fsr3Upscaler: IDisposable
 	private static float Lanczos2(float x) =>
 		MathF.Abs(x) < 1e-6f ? 1.0f : (MathF.Sin(MathF.PI * x) / (MathF.PI * x)) * (MathF.Sin(0.5f * MathF.PI * x) / (0.5f * MathF.PI * x));
 
-	/// <summary>Cached views on the game's textures</summary>
-	private nint InputView(nint texture, bool unordered)
+	private ID3D11ShaderResourceView* InputSrv(ID3D11Texture2D* texture)
 	{
-		if (this.inputViews.TryGetValue((texture, unordered), out nint view))
-			return view;
-
-		D3D11.Texture2DDesc desc = D3D11.GetDesc(texture);
-		uint format = desc.Format switch
+		if (!this.inputSrvs.TryGetValue((nint)texture, out nint view))
 		{
-			44 => D3D11.FormatR24UnormX8Typeless, // R24G8_TYPELESS
-			39 => D3D11.FormatR32Float, // R32_TYPELESS
-			_ => desc.Format,
-		};
-		view = unordered ? D3D11.CreateUav(this.device, texture, format) : D3D11.CreateSrv(this.device, texture, format);
-		this.inputViews[(texture, unordered)] = view;
-		return view;
+			view = (nint)Dx.CreateSrv(this.device, texture, Dx.ReadableFormat(Dx.GetDesc(texture).Format));
+			this.inputSrvs[(nint)texture] = view;
+		}
+
+		return (ID3D11ShaderResourceView*)view;
 	}
 
-	private Texture Create(uint width, uint height, uint format)
+	private ID3D11UnorderedAccessView* InputUav(ID3D11Texture2D* texture)
 	{
-		nint texture = this.Own(D3D11.CreateTexture(this.device, width, height, format, 1, D3D11.BindShaderResource | D3D11.BindUnorderedAccess));
-		return new Texture(texture, this.Own(D3D11.CreateSrv(this.device, texture)), this.Own(D3D11.CreateUav(this.device, texture, format)));
+		if (!this.inputUavs.TryGetValue((nint)texture, out nint view))
+		{
+			view = (nint)Dx.CreateUav(this.device, texture, Dx.GetDesc(texture).Format);
+			this.inputUavs[(nint)texture] = view;
+		}
+
+		return (ID3D11UnorderedAccessView*)view;
 	}
 
-	private Texture CreateReadOnly(uint width, uint format, void* data, uint pitch)
+	private Texture Create(uint width, uint height, DXGI_FORMAT format)
 	{
-		nint texture = this.Own(D3D11.CreateTexture(this.device, width, 1, format, 1, D3D11.BindShaderResource, data, pitch));
-		return new Texture(texture, this.Own(D3D11.CreateSrv(this.device, texture)), 0);
+		ID3D11Texture2D* texture = this.Own(Dx.CreateTexture(this.device, width, height, format, 1, Dx.BindShaderResourceAndUav));
+		return new Texture(this.Own(Dx.CreateSrv(this.device, texture)), this.Own(Dx.CreateUav(this.device, texture, format)));
 	}
 
-	private nint Own(nint obj)
+	private Texture CreateReadOnly(uint width, DXGI_FORMAT format, void* data, uint pitch)
 	{
-		this.owned.Add(obj);
+		ID3D11Texture2D* texture = this.Own(Dx.CreateTexture(this.device, width, 1, format, 1, (uint)D3D11_BIND_SHADER_RESOURCE, data, pitch));
+		return new Texture(this.Own(Dx.CreateSrv(this.device, texture)), null);
+	}
+
+	private T* Own<T>(T* obj) where T : unmanaged
+	{
+		this.owned.Add((nint)obj);
 		return obj;
 	}
 
 	private Pass LoadPass(string name)
 	{
-		byte[] bytecode = ReadResource($"Shaders.{name}.cso");
 		List<(string, string, uint)> bindings = [];
-		using StreamReader reader = new(new MemoryStream(ReadResource($"Shaders.{name}.txt")));
+		using StreamReader reader = new(new MemoryStream(Dx.ReadResource($"Shaders.{name}.txt")));
 		while (reader.ReadLine() is { } line)
 		{
 			string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -557,25 +552,20 @@ public unsafe class Fsr3Upscaler: IDisposable
 				bindings.Add((parts[0], parts[1], uint.Parse(parts[2])));
 		}
 
-		return new Pass(this.Own(D3D11.CreateComputeShader(this.device, bytecode)), bindings);
-	}
-
-	private static byte[] ReadResource(string name)
-	{
-		using Stream stream = typeof(Fsr3Upscaler).Assembly.GetManifestResourceStream(name) ??
-		                      throw new InvalidOperationException($"missing resource {name}");
-		using MemoryStream memory = new();
-		stream.CopyTo(memory);
-		return memory.ToArray();
+		return new Pass(this.Own(Dx.CreateComputeShader(this.device, $"Shaders.{name}.cso")), bindings);
 	}
 
 	public void Dispose()
 	{
-		foreach (nint view in this.inputViews.Values)
-			D3D11.Release(view);
-		this.inputViews.Clear();
+		foreach (nint view in this.inputSrvs.Values)
+			Dx.Release((IUnknown*)view);
+		foreach (nint view in this.inputUavs.Values)
+			Dx.Release((IUnknown*)view);
+		this.inputSrvs.Clear();
+		this.inputUavs.Clear();
+		this.timer?.Dispose();
 		foreach (nint obj in this.owned)
-			D3D11.Release(obj);
+			Dx.Release((IUnknown*)obj);
 		this.owned.Clear();
 		GC.SuppressFinalize(this);
 	}

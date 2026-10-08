@@ -10,6 +10,9 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.PostEffect;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Render;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 
+using TerraFX.Interop.DirectX;
+
+using UpscaleBuddy.Ffx;
 using UpscaleBuddy.Fsr3;
 
 using RenderCamera = FFXIVClientStructs.FFXIV.Client.Graphics.Render.Camera;
@@ -18,7 +21,7 @@ using SceneCamera = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.Camera;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Runs FSR 3.1 through the game's DLSS path by replacing the statically linked NGX calls
+/// Runs FSR through the game's DLSS path by replacing the statically linked NGX calls
 /// Only active while the game's upscaler setting is AMD FSR
 /// </summary>
 public unsafe class DlssPath: IDisposable
@@ -39,7 +42,7 @@ public unsafe class DlssPath: IDisposable
 	// MemAlloc(0x188), ctor, PostEffectManager+0x4220, RenderTargetManager+0x730 = render size callback
 	private const string MemAllocSignature = "E8 ?? ?? ?? ?? 48 8B F8 41 BE";
 	private const string DlssObjectCtorSignature = "E8 ?? ?? ?? ?? EB ?? 49 8B C7 48 89 87 ?? ?? ?? ?? 48 8D 0D";
-	private const string RenderSizeCallbackSignature = "48 8D 0D ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 89 88 ?? ?? ?? ?? 48 8B CF E8";
+	private const string RenderSizeCallbackSignature = "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B 05 ?? ?? ?? ?? 49 8B F9"; // FUN_140352100
 	private const int DlssObjectSize = 0x188;
 	private const int DlssObjectOffset = 0x4220;
 	private const int RenderSizeCallbackOffset = 0x730;
@@ -60,8 +63,8 @@ public unsafe class DlssPath: IDisposable
 
 	private delegate int InitDelegate(ulong applicationId, nint path, nint device, nint featureInfo, int version);
 	private delegate int CapabilitiesDelegate(nint* parameters);
-	private delegate int CreateDelegate(nint context, int feature, nint parameters, nint* handle);
-	private delegate int EvaluateDelegate(nint context, nint handle, nint parameters, nint progress);
+	private delegate int CreateDelegate(ID3D11DeviceContext* context, int feature, nint parameters, nint* handle);
+	private delegate int EvaluateDelegate(ID3D11DeviceContext* context, nint handle, nint parameters, nint progress);
 	private delegate int HandleDelegate(nint handle);
 	private delegate int OptimalSettingsDelegate(nint parameters);
 	private delegate void RenderSizeDelegate(nint renderTargetManager, uint* size, byte allocate);
@@ -83,6 +86,7 @@ public unsafe class DlssPath: IDisposable
 	private readonly Hook<HandleDelegate>? destroyParametersHook;
 	private readonly Hook<HandleDelegate>? shutdownHook;
 	private readonly Hook<RenderSizeDelegate>? renderSizeHook;
+	private readonly SharedTargets? sharedTargets;
 	private readonly delegate* unmanaged<ulong, ulong, ulong, nint> memAlloc;
 	private readonly delegate* unmanaged<nint, nint> dlssObjectCtor;
 	private readonly nint renderSizeCallback;
@@ -100,9 +104,10 @@ public unsafe class DlssPath: IDisposable
 	private volatile float cameraFar = 1000.0f;
 	private volatile float cameraFov = 1.0f;
 	private volatile bool infiniteFar;
+	private volatile bool useAmdDll;
 
 	// Render thread
-	private Fsr3Upscaler? upscaler;
+	private IUpscaler? upscaler;
 	private Downsampler? downsampler;
 	private readonly List<IDisposable> retired = [];
 	private readonly object upscalerLock = new();
@@ -151,8 +156,7 @@ public unsafe class DlssPath: IDisposable
 
 			this.memAlloc = (delegate* unmanaged<ulong, ulong, ulong, nint>)Service.SigScanner.ScanText(MemAllocSignature);
 			this.dlssObjectCtor = (delegate* unmanaged<nint, nint>)Service.SigScanner.ScanText(DlssObjectCtorSignature);
-			nint lea = Service.SigScanner.ScanText(RenderSizeCallbackSignature);
-			this.renderSizeCallback = lea + 7 + *(int*)(lea + 3);
+			this.renderSizeCallback = Service.SigScanner.ScanText(RenderSizeCallbackSignature);
 
 			this.Available = true;
 		}
@@ -160,6 +164,19 @@ public unsafe class DlssPath: IDisposable
 		{
 			this.Status = "Unavailable (signature not found)";
 			Service.PluginLog.Warning(e, "DlssPath unavailable");
+		}
+
+		// Optional, without it the AMD DLL path copies its inputs
+		if (this.Available)
+		{
+			try
+			{
+				this.sharedTargets = new SharedTargets();
+			}
+			catch (Exception e)
+			{
+				Service.PluginLog.Warning(e, "Zero copy unavailable, the AMD DLL path copies its inputs");
+			}
 		}
 	}
 
@@ -179,7 +196,7 @@ public unsafe class DlssPath: IDisposable
 
 	public double CpuMs { get; private set; }
 
-	public double GpuMs => this.upscaler?.GpuMs ?? 0;
+	public string GpuTimings => this.upscaler?.Timings ?? "";
 
 	public static float Scale(UpscaleMode mode) => mode switch
 	{
@@ -290,6 +307,18 @@ public unsafe class DlssPath: IDisposable
 		this.sharpen = this.configuration.Sharpening;
 		this.sharpness = this.configuration.Sharpness;
 		this.measure = this.configuration.ShowTimings;
+		if (this.useAmdDll != this.configuration.UseAmdDll)
+		{
+			// Next frame creates the feature with the other upscaler
+			this.useAmdDll = this.configuration.UseAmdDll;
+			this.InvalidateFeature();
+
+			// Reallocate so the targets D3D12 reads are created shared, or plain again
+			if (this.sharedTargets != null)
+				this.sharedTargets.Enabled = this.useAmdDll;
+			this.allocatedSupersample = -1;
+		}
+
 		this.supersample = Math.Max(1.0f, 1.0f / Scale(this.configuration.Mode));
 		this.RequestReallocation();
 
@@ -311,7 +340,10 @@ public unsafe class DlssPath: IDisposable
 	{
 		GraphicsConfig.Instance()->GraphicsRezoUpscaleType = GameSettingIsFsr() ? UpscaleTypeFsr : UpscaleTypeDlss;
 		this.supersample = 1.0f;
-		this.allocatedSupersample = 0; // Back to the game's render size
+		this.allocatedSupersample = 0; // Back to the game's render size, the targets unshared
+		if (this.sharedTargets != null)
+			this.sharedTargets.Enabled = false;
+		this.useAmdDll = false;
 		this.requestedRenderHeight = 0;
 		this.RequestReallocation();
 		this.state = State.Releasing;
@@ -472,7 +504,7 @@ public unsafe class DlssPath: IDisposable
 	/// <summary>
 	/// Render thread, command from FUN_140374a60
 	/// </summary>
-	private int CreateDetour(nint context, int feature, nint parameterObject, nint* handle)
+	private int CreateDetour(ID3D11DeviceContext* context, int feature, nint parameterObject, nint* handle)
 	{
 		*handle = this.featureHandle;
 		this.DisposeRetired();
@@ -491,14 +523,30 @@ public unsafe class DlssPath: IDisposable
 			this.downsampler = null;
 		}
 
-		nint device = D3D11.GetDevice(context);
+		ID3D11Device* device;
+		context->GetDevice(&device);
 		try
 		{
 			// Supersampling: FSR at the render size, then down to the output
 			bool supersampling = renderWidth > outputWidth;
-			Fsr3Upscaler created = supersampling
-				? new Fsr3Upscaler(device, renderWidth, renderHeight, renderWidth, renderHeight)
-				: new Fsr3Upscaler(device, renderWidth, renderHeight, outputWidth, outputHeight);
+			uint upscaleWidth = supersampling ? renderWidth : outputWidth;
+			uint upscaleHeight = supersampling ? renderHeight : outputHeight;
+			string? fallback = null;
+			IUpscaler? created = null;
+			if (this.useAmdDll)
+			{
+				try
+				{
+					created = new FfxUpscaler(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight, this.infiniteFar);
+				}
+				catch (Exception e)
+				{
+					fallback = $", AMD DLL failed: {e.Message}";
+					Service.PluginLog.Error(e, "AMD FSR DLL context creation failed, using the built-in FSR 3.1");
+				}
+			}
+
+			created ??= new Fsr3Upscaler(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight);
 			Downsampler? createdDownsampler = supersampling ? new Downsampler(device, renderWidth, renderHeight) : null;
 			lock (this.upscalerLock)
 			{
@@ -510,17 +558,18 @@ public unsafe class DlssPath: IDisposable
 			this.RenderHeight = renderHeight;
 			this.OutputWidth = outputWidth;
 			this.OutputHeight = outputHeight;
-			this.Status = (flags & NgxFeatureFlagDepthInverted) == 0 ? "On (the game reports non-inverted depth, expect artifacts)" : "On";
+			this.Status = $"On, {created.Name}{fallback}" +
+			              ((flags & NgxFeatureFlagDepthInverted) == 0 ? " (the game reports non-inverted depth, expect artifacts)" : "");
 			this.loggedEvaluateError = false;
 		}
 		catch (Exception e)
 		{
 			this.Status = $"Failed to start: {e.Message}";
-			Service.PluginLog.Error(e, "FSR 3.1 context creation failed");
+			Service.PluginLog.Error(e, "FSR context creation failed");
 		}
 		finally
 		{
-			D3D11.Release(device);
+			device->Release();
 		}
 
 		return NgxParameters.Success;
@@ -529,7 +578,7 @@ public unsafe class DlssPath: IDisposable
 	/// <summary>
 	/// Render thread, command from PostEffectManager.Submit
 	/// </summary>
-	private int EvaluateDetour(nint context, nint handle, nint parameterObject, nint progress)
+	private int EvaluateDetour(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
 	{
 		this.DisposeRetired();
 
@@ -537,7 +586,7 @@ public unsafe class DlssPath: IDisposable
 		float frameTime = this.lastEvaluate == 0 ? 16.6f : (float)((now - this.lastEvaluate) * 1000.0 / Stopwatch.Frequency);
 		this.lastEvaluate = now;
 
-		Fsr3Upscaler? current;
+		IUpscaler? current;
 		Downsampler? currentDownsampler;
 		lock (this.upscalerLock)
 		{
@@ -545,13 +594,13 @@ public unsafe class DlssPath: IDisposable
 			currentDownsampler = this.downsampler;
 		}
 
-
+		// NGX resources, all 2D textures here
 		Fsr3Upscaler.DispatchParams dispatch = new()
 		{
-			Color = this.parameters.Pointer("Color"),
-			Depth = this.parameters.Pointer("Depth"),
-			MotionVectors = this.parameters.Pointer("MotionVectors"),
-			Output = this.parameters.Pointer("Output"),
+			Color = (ID3D11Texture2D*)this.parameters.Pointer("Color"),
+			Depth = (ID3D11Texture2D*)this.parameters.Pointer("Depth"),
+			MotionVectors = (ID3D11Texture2D*)this.parameters.Pointer("MotionVectors"),
+			Output = (ID3D11Texture2D*)this.parameters.Pointer("Output"),
 			RenderWidth = (uint)this.parameters.Number("DLSS.Render.Subrect.Dimensions.Width"),
 			RenderHeight = (uint)this.parameters.Number("DLSS.Render.Subrect.Dimensions.Height"),
 			JitterX = (float)this.parameters.Number("Jitter.Offset.X"),
@@ -570,7 +619,7 @@ public unsafe class DlssPath: IDisposable
 			Measure = this.measure,
 		};
 
-		if (current == null || dispatch.Color == 0 || dispatch.Depth == 0 || dispatch.MotionVectors == 0 || dispatch.Output == 0)
+		if (current == null || dispatch.Color == null || dispatch.Depth == null || dispatch.MotionVectors == null || dispatch.Output == null)
 			return NgxParameters.Fail;
 
 		if (dispatch.RenderWidth == 0 || dispatch.RenderHeight == 0)
@@ -579,18 +628,18 @@ public unsafe class DlssPath: IDisposable
 			dispatch.RenderHeight = current.MaxRenderHeight;
 		}
 
-		nint gameOutput = dispatch.Output;
+		ID3D11Texture2D* gameOutput = dispatch.Output;
 		if (currentDownsampler != null)
 		{
 			// Until the requested resize has run the game still renders at the display size
-			D3D11.Texture2DDesc colorDesc = D3D11.GetDesc(dispatch.Color);
+			D3D11_TEXTURE2D_DESC colorDesc = Dx.GetDesc(dispatch.Color);
 			if (colorDesc.Width < current.MaxRenderWidth || colorDesc.Height < current.MaxRenderHeight)
 			{
 				this.Status = $"Waiting for the render targets ({colorDesc.Width}x{colorDesc.Height} allocated)";
 				return NgxParameters.Fail;
 			}
 
-			D3D11.Texture2DDesc outputDesc = D3D11.GetDesc(gameOutput);
+			D3D11_TEXTURE2D_DESC outputDesc = Dx.GetDesc(gameOutput);
 			dispatch.Output = currentDownsampler.Intermediate;
 			this.Status = $"On (supersampling, output texture {outputDesc.Width}x{outputDesc.Height})";
 		}
@@ -612,7 +661,7 @@ public unsafe class DlssPath: IDisposable
 			{
 				this.loggedEvaluateError = true;
 				this.Status = $"Error: {e.Message}";
-				Service.PluginLog.Error(e, "FSR 3.1 dispatch failed");
+				Service.PluginLog.Error(e, "FSR dispatch failed");
 			}
 
 			return NgxParameters.Fail;
@@ -679,6 +728,7 @@ public unsafe class DlssPath: IDisposable
 		this.destroyParametersHook?.Dispose();
 		this.shutdownHook?.Dispose();
 		this.renderSizeHook?.Dispose();
+		this.sharedTargets?.Dispose();
 
 		lock (this.upscalerLock)
 		{

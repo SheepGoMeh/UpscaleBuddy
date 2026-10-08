@@ -1,8 +1,9 @@
-# Compiles the FSR 3.1 upscaler passes for cs_5_0 into Shaders/Compiled, copies the FSR DLLs next to them
-# Usage: .\Build-Shaders.ps1 -Sdk <FidelityFX-SDK 2.x checkout>
+# Compiles the FSR 3.1 upscaler passes for cs_5_0 into Shaders/Compiled, copies the FSR and XeSS DLLs next to them
+# Usage: .\Build-Shaders.ps1 -Sdk <FidelityFX-SDK 2.x checkout> -Xess <XeSS SDK 3.x checkout>
 # Output: <pass>.cso and <pass>.txt with "<kind> <name> <slot>" bindings
 param(
 	[Parameter(Mandatory = $true)][string]$Sdk,
+	[Parameter(Mandatory = $true)][string]$Xess,
 	[string]$Fxc = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
 )
 
@@ -81,8 +82,12 @@ foreach ($name in @('downsample', 'depth_copy')) {
 	Write-Host "$name : built"
 }
 
-# AMD's signed FSR DLLs (FSR 4 on RDNA 4, FSR 3.1 elsewhere), loaded by Ffx/FfxUpscaler.cs
+# AMD's signed FSR DLLs (FSR 4 where supported, FSR 3.1 elsewhere), loaded by Ffx/FfxBackend.cs
 foreach ($name in @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll')) {
 	Copy-Item (Join-Path $kit "signedbin\$name") $out
 	Write-Host "$name : copied"
 }
+
+# Intel's signed XeSS super resolution DLL, loaded by Xess/XessBackend.cs
+Copy-Item (Join-Path $Xess 'bin\libxess.dll') $out
+Write-Host "libxess.dll : copied"

@@ -2,8 +2,8 @@
   "Author": "SheepGoMeh",
   "Name": "UpscaleBuddy",
   "InternalName": "UpscaleBuddy",
-  "Description": "Runs AMD FSR temporal upscaling and anti-aliasing through the game's own DLSS path.\nBuilt-in FSR 3.1 works on any GPU; AMD's FSR DLL over D3D12 adds FSR 4 where the GPU and driver support it.\nSupports the FSR quality presets and Native AA.\nOpen the settings with /upscalebuddy",
-  "Punchline": "FSR 3.1 and FSR 4 upscaling and anti-aliasing.",
+  "Description": "Runs temporal upscaling and anti-aliasing through the game's own DLSS path.\nBuilt-in FSR 3.1 works on any GPU; AMD's FSR DLL over D3D12 adds FSR 4 where the GPU and driver support it, and Intel's XeSS runs over D3D12 too.\nSupports the quality presets and Native AA.\nOpen the settings with /upscalebuddy",
+  "Punchline": "FSR 3.1, FSR 4 and XeSS upscaling and anti-aliasing.",
   "Tags": ["Graphics", "Upscaling", "FSR", "Anti-aliasing"],
   "ApplicableVersion": "any",
   "IconUrl": "https://raw.githubusercontent.com/SheepGoMeh/UpscaleBuddy/main/images/icon.png"

@@ -12,8 +12,10 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 
 using TerraFX.Interop.DirectX;
 
+using UpscaleBuddy.D3D12;
 using UpscaleBuddy.Ffx;
 using UpscaleBuddy.Fsr3;
+using UpscaleBuddy.Xess;
 
 using RenderCamera = FFXIVClientStructs.FFXIV.Client.Graphics.Render.Camera;
 using SceneCamera = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.Camera;
@@ -104,7 +106,7 @@ public unsafe class DlssPath: IDisposable
 	private volatile float cameraFar = 1000.0f;
 	private volatile float cameraFov = 1.0f;
 	private volatile bool infiniteFar;
-	private volatile bool useAmdDll;
+	private volatile Upscaler selectedUpscaler;
 
 	// Render thread
 	private IUpscaler? upscaler;
@@ -307,15 +309,15 @@ public unsafe class DlssPath: IDisposable
 		this.sharpen = this.configuration.Sharpening;
 		this.sharpness = this.configuration.Sharpness;
 		this.measure = this.configuration.ShowTimings;
-		if (this.useAmdDll != this.configuration.UseAmdDll)
+		if (this.selectedUpscaler != this.configuration.Upscaler)
 		{
 			// Next frame creates the feature with the other upscaler
-			this.useAmdDll = this.configuration.UseAmdDll;
+			this.selectedUpscaler = this.configuration.Upscaler;
 			this.InvalidateFeature();
 
 			// Reallocate so the targets D3D12 reads are created shared, or plain again
 			if (this.sharedTargets != null)
-				this.sharedTargets.Enabled = this.useAmdDll;
+				this.sharedTargets.Enabled = this.selectedUpscaler != Upscaler.BuiltInFsr3;
 			this.allocatedSupersample = -1;
 		}
 
@@ -343,7 +345,7 @@ public unsafe class DlssPath: IDisposable
 		this.allocatedSupersample = 0; // Back to the game's render size, the targets unshared
 		if (this.sharedTargets != null)
 			this.sharedTargets.Enabled = false;
-		this.useAmdDll = false;
+		this.selectedUpscaler = Upscaler.BuiltInFsr3;
 		this.requestedRenderHeight = 0;
 		this.RequestReallocation();
 		this.state = State.Releasing;
@@ -501,6 +503,17 @@ public unsafe class DlssPath: IDisposable
 		return NgxParameters.Success;
 	}
 
+	/// <summary>A D3D12 library on the shim, created with the device the shim makes</summary>
+	private static IUpscaler CreateD3D12(ID3D11Device* device, Upscaler selected, uint renderWidth, uint renderHeight, uint upscaleWidth,
+		uint upscaleHeight, bool infiniteFar) => selected switch
+	{
+		Upscaler.AmdFsr => new D3D12Upscaler(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight,
+			d3d12 => new FfxBackend(d3d12, renderWidth, renderHeight, upscaleWidth, upscaleHeight, infiniteFar)),
+		Upscaler.IntelXess => new D3D12Upscaler(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight,
+			d3d12 => new XessBackend(d3d12, renderWidth, upscaleWidth, upscaleHeight)),
+		_ => throw new ArgumentOutOfRangeException(nameof(selected), selected, null),
+	};
+
 	/// <summary>
 	/// Render thread, command from FUN_140374a60
 	/// </summary>
@@ -533,16 +546,17 @@ public unsafe class DlssPath: IDisposable
 			uint upscaleHeight = supersampling ? renderHeight : outputHeight;
 			string? fallback = null;
 			IUpscaler? created = null;
-			if (this.useAmdDll)
+			Upscaler selected = this.selectedUpscaler;
+			if (selected != Upscaler.BuiltInFsr3)
 			{
 				try
 				{
-					created = new FfxUpscaler(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight, this.infiniteFar);
+					created = CreateD3D12(device, selected, renderWidth, renderHeight, upscaleWidth, upscaleHeight, this.infiniteFar);
 				}
 				catch (Exception e)
 				{
-					fallback = $", AMD DLL failed: {e.Message}";
-					Service.PluginLog.Error(e, "AMD FSR DLL context creation failed, using the built-in FSR 3.1");
+					fallback = $", {selected} failed: {e.Message}";
+					Service.PluginLog.Error(e, $"{selected} context creation failed, using the built-in FSR 3.1");
 				}
 			}
 

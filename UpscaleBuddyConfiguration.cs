@@ -16,6 +16,13 @@ public enum UpscaleMode
 	Supersample175,
 }
 
+public enum Upscaler
+{
+	BuiltInFsr3,
+	AmdFsr,
+	IntelXess,
+}
+
 public class UpscaleBuddyConfiguration: IPluginConfiguration
 {
 	public int Version { get; set; }
@@ -24,7 +31,7 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	public bool Sharpening = true;
 	public float Sharpness = 0.5f;
 	public bool ShowTimings;
-	public bool UseAmdDll;
+	public Upscaler Upscaler = Upscaler.BuiltInFsr3;
 
 	public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }

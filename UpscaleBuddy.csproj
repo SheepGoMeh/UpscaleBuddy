@@ -1,6 +1,6 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
 	<PropertyGroup>
-		<AssemblyVersion>0.1.5.0</AssemblyVersion>
+		<AssemblyVersion>0.1.6.0</AssemblyVersion>
 		<FileVersion>$(AssemblyVersion)</FileVersion>
 		<IsPackable>false</IsPackable>
 		<Authors>SheepGoMeh</Authors>
@@ -20,6 +20,7 @@
 		<EmbeddedResource Include="Shaders\Compiled\*.txt" LogicalName="Shaders.%(Filename)%(Extension)" />
 		<None Include="Shaders\Compiled\*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
 		<None Include="Shaders\LICENSE-FidelityFX.txt" CopyToOutputDirectory="PreserveNewest" Link="LICENSE-FidelityFX.txt" />
+		<None Include="Shaders\LICENSE-XeSS.txt" CopyToOutputDirectory="PreserveNewest" Link="LICENSE-XeSS.txt" />
 	</ItemGroup>
 	<Target Name="CheckShaders" BeforeTargets="BeforeBuild" Condition="!Exists('Shaders\Compiled\accumulate.cso')">
 		<Error Text="Shaders\Compiled is empty, run Shaders\Build-Shaders.ps1 -Sdk &lt;FidelityFX-SDK checkout&gt;" />

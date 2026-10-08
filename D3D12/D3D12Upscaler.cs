@@ -1,8 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
-using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -23,119 +22,24 @@ using static TerraFX.Interop.DirectX.DXGI;
 using static TerraFX.Interop.DirectX.DXGI_FORMAT;
 using static TerraFX.Interop.Windows.Windows;
 
-namespace UpscaleBuddy.Ffx;
+namespace UpscaleBuddy.D3D12;
 
 /// <summary>
-/// AMD's FSR DLLs (FidelityFX SDK 2.x, FSR 4 where supported, FSR 3.1 elsewhere) on a D3D12 device next to the game's D3D11 one
+/// Runs a D3D12 upscaler library on a D3D12 device next to the game's D3D11 one
 /// Game textures the game created NT shared (Game/SharedTargets) are opened directly, others are copied into shared twins,
-/// depth through a shader since FFX takes no 24 bit depth; a shared fence orders both queues
+/// depth through a shader into R32_FLOAT since the libraries take no 24 bit depth; a shared fence orders both queues
 /// </summary>
-public unsafe class FfxUpscaler: IUpscaler
+public unsafe class D3D12Upscaler: IUpscaler
 {
-	private const string LoaderDll = "amd_fidelityfx_loader_dx12.dll";
-	private const string UpscalerDll = "amd_fidelityfx_upscaler_dx12.dll";
-
-	private const ulong DescCreateUpscale = 0x00010000;
-	private const ulong DescCreateUpscaleVersion = 0x0001000B;
-	private const ulong DescDispatchUpscale = 0x00010001;
-	private const ulong DescBackendDx12 = 0x2;
-	private const ulong DescQueryProviderVersion = 6;
-	private const uint UpscalerVersion = (4 << 22) | (1 << 12) | 1; // FFX_UPSCALER_VERSION 4.1.1, SDK 2.3
-
-	private const uint FlagDepthInverted = 1 << 3;
-	private const uint FlagDepthInfinite = 1 << 4;
-	private const uint ResourceTypeTexture2D = 2;
-	private const uint ResourceUsageUav = 1 << 1;
-	private const uint ResourceStateCommon = 1 << 0;
 	private const int Frames = 8; // Above the swapchain's frame latency, so Present throttles rather than the allocators
 	private const int DirectPruneFrames = 120;
 
-	[StructLayout(LayoutKind.Sequential)]
-	private struct Header
-	{
-		public ulong Type;
-		public Header* Next;
-	}
-
-	[StructLayout(LayoutKind.Sequential)]
-	private struct CreateUpscale
-	{
-		public Header Header;
-		public uint Flags;
-		public uint MaxRenderWidth, MaxRenderHeight;
-		public uint MaxUpscaleWidth, MaxUpscaleHeight;
-		public nint Message;
-	}
-
-	[StructLayout(LayoutKind.Sequential)]
-	private struct CreateUpscaleVersion
-	{
-		public Header Header;
-		public uint Version;
-	}
-
-	[StructLayout(LayoutKind.Sequential)]
-	private struct BackendDx12
-	{
-		public Header Header;
-		public ID3D12Device* Device;
-	}
-
-	[StructLayout(LayoutKind.Sequential)]
-	private struct ProviderVersion
-	{
-		public Header Header;
-		public ulong VersionId;
-		public byte* VersionName;
-	}
-
-	[StructLayout(LayoutKind.Sequential)]
-	private struct Resource
-	{
-		public ID3D12Resource* Pointer;
-		public uint Type, Format, Width, Height, Depth, MipCount, Flags, Usage;
-		public uint State;
-	}
-
-	[StructLayout(LayoutKind.Sequential)]
-	private struct DispatchUpscale
-	{
-		public Header Header;
-		public ID3D12GraphicsCommandList* CommandList;
-		public Resource Color, Depth, MotionVectors, Exposure, Reactive, TransparencyAndComposition, Output;
-		public float JitterX, JitterY;
-		public float MotionVectorScaleX, MotionVectorScaleY;
-		public uint RenderWidth, RenderHeight;
-		public uint UpscaleWidth, UpscaleHeight;
-		public byte EnableSharpening;
-		public float Sharpness;
-		public float FrameTimeDelta;
-		public float PreExposure;
-		public byte Reset;
-		public float CameraNear;
-		public float CameraFar;
-		public float CameraFovAngleVertical;
-		public float ViewSpaceToMetersFactor;
-		public uint Flags;
-	}
-
-	/// <summary>D3D12 view of a D3D11 texture: our own twin, or the game's texture itself when it's shared</summary>
-	private sealed class Twin(ID3D11Texture2D* texture11, ID3D12Resource* resource12, Resource description)
+	/// <summary>A D3D11 texture opened on D3D12: our own twin, or the game's texture itself when it's shared</summary>
+	private sealed class Twin(ID3D11Texture2D* texture11, Input input)
 	{
 		public readonly ID3D11Texture2D* Texture11 = texture11;
-		public readonly ID3D12Resource* Resource12 = resource12;
-		public readonly Resource Description = description;
+		public readonly Input Input = input;
 	}
-
-	private delegate void MessageDelegate(uint type, char* message);
-
-	// Kept alive here, the DLL calls it from any context
-	private static readonly MessageDelegate MessageCallback = OnMessage;
-
-	private static delegate* unmanaged<nint*, Header*, void*, uint> createContext;
-	private static delegate* unmanaged<nint*, void*, uint> destroyContext;
-	private static delegate* unmanaged<nint*, Header*, uint> query;
-	private static delegate* unmanaged<nint*, Header*, uint> dispatch;
 
 	private readonly ID3D11Device5* device11;
 	private readonly ID3D12Device* device12;
@@ -146,17 +50,17 @@ public unsafe class FfxUpscaler: IUpscaler
 	private readonly ID3D12GraphicsCommandList*[] lists = new ID3D12GraphicsCommandList*[Frames];
 	private readonly ulong[] frameFence = new ulong[Frames];
 	private readonly ID3D11ComputeShader* depthShader;
+	private readonly IBackend? backend;
 
-	// D3D11 marks: start, inputs copied, D3D12 done, output copied; D3D12: around ffxDispatch, two per frame slot
+	// D3D11 marks: start, inputs copied, D3D12 done, output copied; D3D12: around the backend, two per frame slot
 	private readonly GpuTimer timer;
 	private readonly ID3D12QueryHeap* queryHeap;
 	private readonly ID3D12Resource* readback;
 	private readonly ulong* timestamps;
 	private readonly ulong timestampFrequency;
 	private readonly bool[] measured = new bool[Frames];
-	private double fsrMs;
+	private double backendMs;
 	private double cpuStallMs;
-	private nint ffxContext;
 	private ulong fenceValue;
 	private int frame;
 
@@ -175,13 +79,13 @@ public unsafe class FfxUpscaler: IUpscaler
 	private int dispatchCount;
 	private bool directColorUsed, directMotionVectorsUsed, directOutputUsed;
 
-	public FfxUpscaler(ID3D11Device* device, uint maxRenderWidth, uint maxRenderHeight, uint upscaleWidth, uint upscaleHeight, bool infiniteFar)
+	public D3D12Upscaler(ID3D11Device* device, uint maxRenderWidth, uint maxRenderHeight, uint upscaleWidth, uint upscaleHeight,
+		BackendFactory createBackend)
 	{
 		this.MaxRenderWidth = maxRenderWidth;
 		this.MaxRenderHeight = maxRenderHeight;
 		this.UpscaleWidth = upscaleWidth;
 		this.UpscaleHeight = upscaleHeight;
-		LoadLibrary();
 
 		try
 		{
@@ -247,26 +151,7 @@ public unsafe class FfxUpscaler: IUpscaler
 			this.timestampFrequency = frequency;
 
 			this.depthShader = Dx.CreateComputeShader(device, "Shaders.depth_copy.cso");
-
-			BackendDx12 backend = new() { Header = { Type = DescBackendDx12 }, Device = this.device12 };
-			CreateUpscaleVersion version = new() { Header = { Type = DescCreateUpscaleVersion, Next = &backend.Header }, Version = UpscalerVersion };
-			CreateUpscale create = new()
-			{
-				Header = { Type = DescCreateUpscale, Next = &version.Header },
-				// Same permutation as the built-in shaders: LDR, low resolution MVs, inverted depth
-				Flags = FlagDepthInverted | (infiniteFar ? FlagDepthInfinite : 0),
-				MaxRenderWidth = maxRenderWidth, MaxRenderHeight = maxRenderHeight,
-				MaxUpscaleWidth = upscaleWidth, MaxUpscaleHeight = upscaleHeight,
-				Message = Marshal.GetFunctionPointerForDelegate(MessageCallback),
-			};
-			nint context;
-			Check(createContext(&context, &create.Header, null), "ffxCreateContext");
-			this.ffxContext = context;
-
-			ProviderVersion provider = new() { Header = { Type = DescQueryProviderVersion } };
-			this.Name = query(&context, &provider.Header) == 0 && provider.VersionName != null
-				? $"FSR {Marshal.PtrToStringAnsi((nint)provider.VersionName)} (AMD DLL, D3D12)"
-				: "FSR (AMD DLL, D3D12)";
+			this.backend = createBackend(this.device12);
 		}
 		catch
 		{
@@ -275,7 +160,7 @@ public unsafe class FfxUpscaler: IUpscaler
 		}
 	}
 
-	public string Name { get; } = "";
+	public string Name => this.backend!.Name;
 
 	public uint MaxRenderWidth { get; }
 
@@ -285,14 +170,15 @@ public unsafe class FfxUpscaler: IUpscaler
 
 	public uint UpscaleHeight { get; }
 
-	/// <summary>Handoff = D3D11 waiting on D3D12 minus FSR itself: fence latency, queue switches, late D3D12 submission</summary>
+	/// <summary>Handoff = D3D11 waiting on D3D12 minus the backend: fence latency, queue switches, late D3D12 submission</summary>
 	public string Timings
 	{
 		get
 		{
 			double[] ms = this.timer.Ms;
-			return $"GPU {ms[0] + ms[1] + ms[2]:F3} ms = copy in {ms[0]:F3} + FSR {this.fsrMs:F3} + handoff {ms[1] - this.fsrMs:F3} + copy out {ms[2]:F3}, " +
-			       $"CPU stall on allocators {this.cpuStallMs:F3} ms, zero copy: color {this.directColorUsed}, motion vectors {this.directMotionVectorsUsed}, output {this.directOutputUsed}";
+			return $"GPU {ms[0] + ms[1] + ms[2]:F3} ms = copy in {ms[0]:F3} + {this.backend!.Label} {this.backendMs:F3} + " +
+			       $"handoff {ms[1] - this.backendMs:F3} + copy out {ms[2]:F3}, CPU stall on allocators {this.cpuStallMs:F3} ms, " +
+			       $"zero copy: color {this.directColorUsed}, motion vectors {this.directMotionVectorsUsed}, output {this.directOutputUsed}";
 		}
 	}
 
@@ -327,9 +213,9 @@ public unsafe class FfxUpscaler: IUpscaler
 
 		// D3D11: game textures into the twins unless D3D12 reads them directly, then hand over to the D3D12 queue
 		if (directColor == null)
-			Copy(context, colorTwin.Texture11, p.Color, colorTwin.Description);
+			Copy(context, colorTwin.Texture11, p.Color, colorTwin.Input);
 		if (directMotionVectors == null)
-			Copy(context, motionVectorsTwin.Texture11, p.MotionVectors, motionVectorsTwin.Description);
+			Copy(context, motionVectorsTwin.Texture11, p.MotionVectors, motionVectorsTwin.Input);
 		this.CopyDepth(context, p.Depth);
 		if (p.Measure)
 			this.timer.Mark(context, 1);
@@ -347,7 +233,7 @@ public unsafe class FfxUpscaler: IUpscaler
 		if (this.measured[slot])
 		{
 			ulong elapsed = this.timestamps[(slot * 2) + 1] - this.timestamps[slot * 2];
-			this.fsrMs = (this.fsrMs * 0.9) + (elapsed * 1000.0 / this.timestampFrequency * 0.1);
+			this.backendMs = (this.backendMs * 0.9) + (elapsed * 1000.0 / this.timestampFrequency * 0.1);
 			this.measured[slot] = false;
 		}
 
@@ -356,44 +242,21 @@ public unsafe class FfxUpscaler: IUpscaler
 		if (p.Measure)
 			list->EndQuery(this.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, (uint)slot * 2);
 
-		DispatchUpscale desc = new()
-		{
-			Header = { Type = DescDispatchUpscale },
-			CommandList = list,
-			Color = colorTwin.Description,
-			Depth = this.depth.Description,
-			MotionVectors = motionVectorsTwin.Description,
-			Output = outputTwin.Description,
-			JitterX = p.JitterX,
-			JitterY = p.JitterY,
-			MotionVectorScaleX = p.MotionVectorScaleX,
-			MotionVectorScaleY = p.MotionVectorScaleY,
-			RenderWidth = p.RenderWidth,
-			RenderHeight = p.RenderHeight,
-			UpscaleWidth = this.UpscaleWidth,
-			UpscaleHeight = this.UpscaleHeight,
-			EnableSharpening = p.Sharpen ? (byte)1 : (byte)0,
-			Sharpness = p.Sharpness,
-			FrameTimeDelta = p.FrameTimeMs,
-			PreExposure = p.PreExposure != 0.0f ? p.PreExposure : 1.0f,
-			Reset = p.Reset ? (byte)1 : (byte)0,
-			CameraNear = p.CameraNear,
-			CameraFar = p.CameraFar,
-			CameraFovAngleVertical = p.CameraFovY,
-			ViewSpaceToMetersFactor = 1.0f,
-		};
-
-		nint ffx = this.ffxContext;
-		uint result;
+		// A failing backend still completes the fence handoff below, D3D11 waits on it
+		ExceptionDispatchInfo? failure = null;
 		try
 		{
-			result = dispatch(&ffx, &desc.Header);
-			if (p.Measure && result == 0)
+			this.backend!.Record(list, colorTwin.Input, motionVectorsTwin.Input, this.depth.Input, outputTwin.Input, p, this.UpscaleWidth, this.UpscaleHeight);
+			if (p.Measure)
 			{
 				list->EndQuery(this.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ((uint)slot * 2) + 1);
 				list->ResolveQueryData(this.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, (uint)slot * 2, 2, this.readback, (ulong)slot * 2 * sizeof(ulong));
 				this.measured[slot] = true;
 			}
+		}
+		catch (Exception e)
+		{
+			failure = ExceptionDispatchInfo.Capture(e);
 		}
 		finally
 		{
@@ -401,18 +264,18 @@ public unsafe class FfxUpscaler: IUpscaler
 		}
 
 		ThrowIfFailed(this.queue->Wait(this.fence12, this.fenceValue));
-		if (result == 0)
+		if (failure == null)
 			this.queue->ExecuteCommandLists(1, (ID3D12CommandList**)&list);
 		ThrowIfFailed(this.queue->Signal(this.fence12, ++this.fenceValue));
 		this.frameFence[slot] = this.fenceValue;
 
 		// D3D11 waits on the GPU, the output twin back into the game's output
 		ThrowIfFailed(this.context4->Wait(this.fence11, this.fenceValue));
-		Check(result, "ffxDispatch");
+		failure?.Throw();
 		if (p.Measure)
 			this.timer.Mark(context, 2);
 		if (directOutput == null)
-			Copy(context, p.Output, outputTwin.Texture11, outputTwin.Description);
+			Copy(context, p.Output, outputTwin.Texture11, outputTwin.Input);
 		if (p.Measure)
 		{
 			this.timer.Mark(context, 3);
@@ -435,16 +298,10 @@ public unsafe class FfxUpscaler: IUpscaler
 			texture->AddRef();
 			this.direct[(nint)texture] = null;
 			D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(texture);
-			uint format = FfxFormatOrZero(desc.Format);
-			if ((desc.MiscFlags & Dx.MiscSharedNtHandle) == Dx.MiscSharedNtHandle && format != 0 && desc.MipLevels == 1)
+			if ((desc.MiscFlags & Dx.MiscSharedNtHandle) == Dx.MiscSharedNtHandle && desc.MipLevels == 1)
 			{
-				ID3D12Resource* resource = this.OpenOnD3D12(texture);
-				twin = new Twin(texture, resource, new Resource
-				{
-					Pointer = resource, Type = ResourceTypeTexture2D, Format = format, Width = desc.Width, Height = desc.Height,
-					Depth = 1, MipCount = 1, Usage = (desc.BindFlags & (uint)D3D11_BIND_UNORDERED_ACCESS) != 0 ? ResourceUsageUav : 0,
-					State = ResourceStateCommon,
-				});
+				twin = new Twin(texture, new Input(this.OpenOnD3D12(texture), desc.Format, desc.Width, desc.Height,
+					(desc.BindFlags & (uint)D3D11_BIND_UNORDERED_ACCESS) != 0));
 			}
 
 			this.direct[(nint)texture] = twin;
@@ -471,7 +328,7 @@ public unsafe class FfxUpscaler: IUpscaler
 	private void ReleaseDirect(nint texture)
 	{
 		if (this.direct[texture] is { } twin)
-			Dx.Release(twin.Resource12);
+			Dx.Release(twin.Input.Resource);
 		Dx.Release((ID3D11Texture2D*)texture);
 		this.direct.Remove(texture);
 		this.directSeen.Remove(texture);
@@ -484,12 +341,7 @@ public unsafe class FfxUpscaler: IUpscaler
 			misc: Dx.MiscSharedNtHandle);
 		try
 		{
-			ID3D12Resource* resource = this.OpenOnD3D12(texture);
-			return new Twin(texture, resource, new Resource
-			{
-				Pointer = resource, Type = ResourceTypeTexture2D, Format = FfxFormat(format), Width = width, Height = height,
-				Depth = 1, MipCount = 1, Usage = ResourceUsageUav, State = ResourceStateCommon,
-			});
+			return new Twin(texture, new Input(this.OpenOnD3D12(texture), format, width, height, true));
 		}
 		catch
 		{
@@ -514,7 +366,7 @@ public unsafe class FfxUpscaler: IUpscaler
 	}
 
 	/// <summary>Top left of the source, as much as both textures hold</summary>
-	private static void Copy(ID3D11DeviceContext* context, ID3D11Texture2D* destination, ID3D11Texture2D* source, in Resource twin)
+	private static void Copy(ID3D11DeviceContext* context, ID3D11Texture2D* destination, ID3D11Texture2D* source, in Input twin)
 	{
 		D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(source);
 		D3D11_BOX box = new() { right = Math.Min(desc.Width, twin.Width), bottom = Math.Min(desc.Height, twin.Height), back = 1 };
@@ -548,79 +400,23 @@ public unsafe class FfxUpscaler: IUpscaler
 		context->CSSetShader(null, null, 0);
 	}
 
-	private static uint FfxFormat(DXGI_FORMAT format) =>
-		FfxFormatOrZero(format) is var ffx and not 0 ? ffx : throw new NotSupportedException($"{format} has no FFX equivalent here");
-
-	/// <summary>FfxApiSurfaceFormat, SDK 2.3</summary>
-	private static uint FfxFormatOrZero(DXGI_FORMAT format) => format switch
-	{
-		DXGI_FORMAT_R32G32B32A32_FLOAT => 3,
-		DXGI_FORMAT_R16G16B16A16_FLOAT => 4,
-		DXGI_FORMAT_R32G32_FLOAT => 6,
-		DXGI_FORMAT_R10G10B10A2_UNORM => 17,
-		DXGI_FORMAT_R11G11B10_FLOAT => 16,
-		DXGI_FORMAT_R8G8B8A8_UNORM => 10,
-		DXGI_FORMAT_R16G16_FLOAT => 18,
-		DXGI_FORMAT_R32_FLOAT => 28,
-		DXGI_FORMAT_R16_FLOAT => 21,
-		DXGI_FORMAT_B8G8R8A8_UNORM => 14,
-		_ => 0,
-	};
-
-	/// <summary>
-	/// Upscaler DLL first by full path, the loader finds it by name
-	/// </summary>
-	private static void LoadLibrary()
-	{
-		if (createContext != null)
-			return;
-
-		string directory = Service.PluginInterface.AssemblyLocation.DirectoryName!;
-		NativeLibrary.Load(Path.Combine(directory, UpscalerDll));
-		nint loader = NativeLibrary.Load(Path.Combine(directory, LoaderDll));
-		query = (delegate* unmanaged<nint*, Header*, uint>)NativeLibrary.GetExport(loader, "ffxQuery");
-		dispatch = (delegate* unmanaged<nint*, Header*, uint>)NativeLibrary.GetExport(loader, "ffxDispatch");
-		destroyContext = (delegate* unmanaged<nint*, void*, uint>)NativeLibrary.GetExport(loader, "ffxDestroyContext");
-		createContext = (delegate* unmanaged<nint*, Header*, void*, uint>)NativeLibrary.GetExport(loader, "ffxCreateContext");
-	}
-
-	private static void OnMessage(uint type, char* message)
-	{
-		string text = new(message);
-		if (type == 0)
-			Service.PluginLog.Error($"FFX: {text}");
-		else
-			Service.PluginLog.Warning($"FFX: {text}");
-	}
-
-	private static void Check(uint result, string what)
-	{
-		if (result != 0)
-			throw new InvalidOperationException($"{what} failed: {result}");
-	}
-
 	public void Dispose()
 	{
-		// The D3D12 queue can still be running the last frames
+		// The D3D12 queue can still be running the last frames, the backend's context too
 		if (this.queue != null && this.fence12 != null)
 		{
 			this.queue->Signal(this.fence12, ++this.fenceValue);
 			this.CpuWait(this.fenceValue);
 		}
 
-		if (this.ffxContext != 0)
-		{
-			nint context = this.ffxContext;
-			destroyContext(&context, null);
-			this.ffxContext = 0;
-		}
+		this.backend?.Dispose();
 
 		foreach (Twin? twin in new[] { this.color, this.depth, this.motionVectors, this.output })
 		{
 			if (twin == null)
 				continue;
 
-			Dx.Release(twin.Resource12);
+			Dx.Release(twin.Input.Resource);
 			Dx.Release(twin.Texture11);
 		}
 

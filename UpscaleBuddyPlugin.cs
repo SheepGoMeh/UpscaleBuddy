@@ -17,6 +17,9 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly DlssPath dlssPath;
+	private readonly FrameGenerationRunner frameGeneration;
+	private readonly UiLayer uiLayer;
+	private readonly FramePacer framePacer;
 	private readonly WindowSystem windowSystem;
 	private readonly ConfigWindow configWindow;
 
@@ -28,9 +31,12 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		                     new UpscaleBuddyConfiguration();
 
 		this.dlssPath = new DlssPath(this.configuration);
+		this.frameGeneration = new FrameGenerationRunner(this.configuration, this.dlssPath);
+		this.uiLayer = new UiLayer(this.configuration, this.frameGeneration);
+		this.framePacer = new FramePacer(this.configuration, this.uiLayer);
 
 		this.windowSystem = new WindowSystem("UpscaleBuddy");
-		this.configWindow = new ConfigWindow(this.configuration, this.dlssPath);
+		this.configWindow = new ConfigWindow(this.configuration, this.dlssPath, this.framePacer, this.uiLayer, this.frameGeneration);
 		this.windowSystem.AddWindow(this.configWindow);
 
 		Service.PluginInterface.UiBuilder.Draw += this.windowSystem.Draw;
@@ -56,10 +62,22 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		Service.PluginInterface.UiBuilder.OpenConfigUi -= this.configWindow.Toggle;
 		this.windowSystem.RemoveAllWindows();
 
-		// Give queued render commands time to finish before tearing down
-		Service.Framework.RunOnFrameworkThread(this.dlssPath.Stop).Wait();
+		// Present and the tick wait run on the framework thread
+		Service.Framework.RunOnFrameworkThread(this.framePacer.Dispose).Wait();
+
+		// Give queued render commands (upscaler, UI composite) time to finish before tearing down
+		Service.Framework.RunOnFrameworkThread(() =>
+		{
+			this.dlssPath.Stop();
+			this.uiLayer.Stop();
+		}).Wait();
 		Thread.Sleep(200);
-		Service.Framework.RunOnFrameworkThread(this.dlssPath.Finish).Wait();
+		Service.Framework.RunOnFrameworkThread(() =>
+		{
+			this.dlssPath.Finish();
+			this.uiLayer.Dispose();
+			this.frameGeneration.Dispose();
+		}).Wait();
 		this.dlssPath.Dispose();
 	}
 

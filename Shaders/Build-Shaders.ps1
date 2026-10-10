@@ -25,6 +25,10 @@ $accumulate = Join-Path $fsr3 'include\gpu\fsr3upscaler\ffx_fsr3upscaler_accumul
 	-replace 'AccumulationPassData data;', 'AccumulationPassData data = (AccumulationPassData)0;' |
 	Set-Content $accumulate -NoNewline
 
+# The luma pyramid binds its last UAV at u8, which needs 64 UAV slots (feature level 11.1); u2 is free in that pass
+$lumaPyramid = Join-Path $fsr3 'internal\shaders\ffx_fsr3upscaler_luma_pyramid_pass.hlsl'
+(Get-Content $lumaPyramid -Raw) -replace '(FSR3UPSCALER_BIND_UAV_FARTHEST_DEPTH_MIP1\s+)8', '${1}2' | Set-Content $lumaPyramid -NoNewline
+
 $defines = @(
 	'FFX_GPU=1', 'FFX_HLSL=1', 'FFX_HALF=0', 'FFX_SPD_NO_WAVE_OPERATIONS=1',
 	'FFX_FSR3UPSCALER_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0',
@@ -82,8 +86,15 @@ foreach ($name in @('downsample', 'depth_copy')) {
 	Write-Host "$name : built"
 }
 
-# AMD's signed FSR DLLs (FSR 4 where supported, FSR 3.1 elsewhere), loaded by Ffx/FfxBackend.cs
-foreach ($name in @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll')) {
+# UI layer composite, Game/UiLayer.cs
+foreach ($stage in @('vs', 'ps')) {
+	& $Fxc /nologo /T "$($stage)_5_0" /E $stage.ToUpper() /O3 /Fo (Join-Path $out "ui_composite_$stage.cso") (Join-Path $PSScriptRoot 'ui_composite.hlsl') | Where-Object { $_ -match 'error' }
+	if ($LASTEXITCODE -ne 0) { throw "fxc failed for ui_composite $stage" }
+	Write-Host "ui_composite_$stage : built"
+}
+
+# AMD's signed FSR DLLs (FSR 4 where supported, FSR 3.1 elsewhere), loaded by Ffx/FfxBackend.cs and Ffx/FfxFrameGenerator.cs
+foreach ($name in @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'amd_fidelityfx_framegeneration_dx12.dll')) {
 	Copy-Item (Join-Path $kit "signedbin\$name") $out
 	Write-Host "$name : copied"
 }

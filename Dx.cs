@@ -110,8 +110,29 @@ public static unsafe class Dx
 	{
 		byte[] bytecode = ReadResource(resource);
 		ID3D11ComputeShader* shader;
+		HRESULT result;
 		fixed (byte* code = bytecode)
-			ThrowIfFailed(device->CreateComputeShader(code, (nuint)bytecode.Length, null, &shader));
+			result = device->CreateComputeShader(code, (nuint)bytecode.Length, null, &shader);
+		if (result.FAILED)
+			throw new InvalidOperationException($"{resource} couldn't be created (0x{(uint)result.Value:X8}), the GPU or driver lacks a feature it needs");
+		return shader;
+	}
+
+	public static ID3D11VertexShader* CreateVertexShader(ID3D11Device* device, string resource)
+	{
+		byte[] bytecode = ReadResource(resource);
+		ID3D11VertexShader* shader;
+		fixed (byte* code = bytecode)
+			ThrowIfFailed(device->CreateVertexShader(code, (nuint)bytecode.Length, null, &shader));
+		return shader;
+	}
+
+	public static ID3D11PixelShader* CreatePixelShader(ID3D11Device* device, string resource)
+	{
+		byte[] bytecode = ReadResource(resource);
+		ID3D11PixelShader* shader;
+		fixed (byte* code = bytecode)
+			ThrowIfFailed(device->CreatePixelShader(code, (nuint)bytecode.Length, null, &shader));
 		return shader;
 	}
 

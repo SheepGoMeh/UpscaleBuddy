@@ -149,8 +149,30 @@ public unsafe class Fsr3Upscaler: IUpscaler
 	private uint resourceFrameIndex;
 	private float preExposure;
 
+	/// <summary>
+	/// The luma pyramid reads its frame info (R32G32B32A32_FLOAT) and SPD mip 5 (R16G16_FLOAT) back through UAVs: typed UAV
+	/// loads beyond the R32 formats, optional below feature level 12. Without them the shader can't be created
+	/// </summary>
+	private static void RequireSupport(ID3D11Device* device)
+	{
+		D3D11_FEATURE_DATA_D3D11_OPTIONS2 options = default;
+		bool additionalFormats = OperatingSystem.IsWindowsVersionAtLeast(10) &&
+		                         device->CheckFeatureSupport(D3D11_FEATURE.D3D11_FEATURE_D3D11_OPTIONS2, &options, (uint)sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS2)) >= 0 &&
+		                         options.TypedUAVLoadAdditionalFormats;
+		foreach (DXGI_FORMAT format in new[] { DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R16G16_FLOAT })
+		{
+			D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = new() { InFormat = format };
+			additionalFormats &= device->CheckFeatureSupport(D3D11_FEATURE.D3D11_FEATURE_FORMAT_SUPPORT2, &support, (uint)sizeof(D3D11_FEATURE_DATA_FORMAT_SUPPORT2)) >= 0 &&
+			                     (support.OutFormatSupport2 & (uint)D3D11_FORMAT_SUPPORT2.D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+		}
+
+		if (!additionalFormats)
+			throw new NotSupportedException("this GPU or driver can't run the built-in FSR 3.1 (no typed UAV loads), choose AMD FSR (DLL over D3D12)");
+	}
+
 	public Fsr3Upscaler(ID3D11Device* device, uint maxRenderWidth, uint maxRenderHeight, uint upscaleWidth, uint upscaleHeight)
 	{
+		RequireSupport(device);
 		this.device = device;
 		this.maxRenderWidth = maxRenderWidth;
 		this.maxRenderHeight = maxRenderHeight;

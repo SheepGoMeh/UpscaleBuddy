@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Numerics;
 
 using Dalamud.Game.Config;
 using Dalamud.Hooking;
@@ -14,6 +15,7 @@ using TerraFX.Interop.DirectX;
 
 using UpscaleBuddy.D3D12;
 using UpscaleBuddy.Ffx;
+using UpscaleBuddy.FrameGeneration;
 using UpscaleBuddy.Fsr3;
 using UpscaleBuddy.Xess;
 
@@ -108,6 +110,9 @@ public unsafe class DlssPath: IDisposable
 	private volatile bool infiniteFar;
 	private volatile Upscaler selectedUpscaler;
 
+	// Framework thread writes, render thread reads; a frame's worth of tearing doesn't matter to frame generation
+	private Vector3 cameraPosition, cameraUp, cameraRight, cameraForward;
+
 	// Render thread
 	private IUpscaler? upscaler;
 	private Downsampler? downsampler;
@@ -115,6 +120,14 @@ public unsafe class DlssPath: IDisposable
 	private readonly object upscalerLock = new();
 	private long lastEvaluate;
 	private bool loggedEvaluateError;
+	private FrameInputs frame;
+	private bool frameReady;
+
+	// Render thread sets it when the upscaler can't start or dispatch, the framework thread releases
+	private volatile string? failure;
+
+	// Framework thread: the settings that failed, not retried until they change
+	private (Upscaler, UpscaleMode)? failedSettings;
 
 	// Framework thread
 	private State state = State.Idle;
@@ -229,8 +242,24 @@ public unsafe class DlssPath: IDisposable
 			return;
 
 		bool wanted = this.configuration.Mode != UpscaleMode.Off && GameSettingIsFsr();
+
+		// A failed start or dispatch: the game's own upscaler back instead of its render size picture, until the settings change
+		string? failed = this.failure;
+		if (failed != null && this.state == State.Active)
+		{
+			this.failure = null;
+			this.failedSettings = (this.configuration.Upscaler, this.configuration.Mode);
+			this.BeginRelease($"{failed}. The game's own upscaler is back on; change the upscaler or mode to try again");
+			return;
+		}
+
+		if (this.failedSettings is { } settings && settings != (this.configuration.Upscaler, this.configuration.Mode))
+			this.failedSettings = null;
+
 		switch (this.state)
 		{
+			case State.Idle when wanted && this.failedSettings != null:
+				break;
 			case State.Idle when wanted:
 				this.Activate();
 				break;
@@ -279,6 +308,8 @@ public unsafe class DlssPath: IDisposable
 		this.savedRenderSizeCallback = *(nint*)(renderTargetManager + RenderSizeCallbackOffset);
 		*(nint*)(renderTargetManager + RenderSizeCallbackOffset) = this.renderSizeCallback;
 
+		this.failure = null;
+		this.loggedEvaluateError = false;
 		this.EnableHooks(true);
 		this.rejections = 0;
 		this.scale = 0; // Forces a render size update
@@ -314,10 +345,13 @@ public unsafe class DlssPath: IDisposable
 			// Next frame creates the feature with the other upscaler
 			this.selectedUpscaler = this.configuration.Upscaler;
 			this.InvalidateFeature();
+		}
 
-			// Reallocate so the targets D3D12 reads are created shared, or plain again
-			if (this.sharedTargets != null)
-				this.sharedTargets.Enabled = this.selectedUpscaler != Upscaler.BuiltInFsr3;
+		// Reallocate so the targets D3D12 reads are created shared, or plain again
+		bool share = this.selectedUpscaler != Upscaler.BuiltInFsr3 && this.configuration.ZeroCopy;
+		if (this.sharedTargets != null && this.sharedTargets.Enabled != share)
+		{
+			this.sharedTargets.Enabled = share;
 			this.allocatedSupersample = -1;
 		}
 
@@ -435,6 +469,27 @@ public unsafe class DlssPath: IDisposable
 		this.cameraNear = renderCamera->NearPlane;
 		this.cameraFar = renderCamera->FarPlane;
 		this.infiniteFar = !renderCamera->FiniteFarPlane;
+
+		// Basis from the view matrix columns; forward's sign from where the camera looks, the handedness isn't assumed.
+		// ponytail: only FSR 4 frame generation (RX 9000) depends on these, unverified there
+		Matrix4x4 view = renderCamera->ViewMatrix;
+		Vector3 position = renderCamera->Origin;
+		Vector3 forward = Vector3.Normalize(new Vector3(view.M13, view.M23, view.M33));
+		if (Vector3.Dot(forward, (Vector3)camera->LookAtVector - position) < 0)
+			forward = -forward;
+		this.cameraPosition = position;
+		this.cameraRight = Vector3.Normalize(new Vector3(view.M11, view.M21, view.M31));
+		this.cameraUp = Vector3.Normalize(new Vector3(view.M12, view.M22, view.M32));
+		this.cameraForward = forward;
+	}
+
+	/// <summary>Render thread: this frame's upscaler inputs for frame generation, once; false when the upscaler didn't run</summary>
+	public bool TakeFrame(out FrameInputs frame)
+	{
+		frame = this.frame;
+		bool ready = this.frameReady;
+		this.frameReady = false;
+		return ready;
 	}
 
 	private void EnableHooks(bool enable)
@@ -578,7 +633,9 @@ public unsafe class DlssPath: IDisposable
 		}
 		catch (Exception e)
 		{
-			this.Status = $"Failed to start: {e.Message}";
+			// Evaluate would fail every frame and the game show its render size picture: the framework thread gives the game
+			// its own upscaler back
+			this.failure = $"Failed to start: {e.Message}";
 			Service.PluginLog.Error(e, "FSR context creation failed");
 		}
 		finally
@@ -668,13 +725,37 @@ public unsafe class DlssPath: IDisposable
 				double ms = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
 				this.CpuMs = (this.CpuMs * 0.9) + (ms * 0.1);
 			}
+
+			// Still valid at the end of the frame, after ToneAdjust, where frame generation reads them
+			this.frame = new FrameInputs
+			{
+				Depth = dispatch.Depth,
+				MotionVectors = dispatch.MotionVectors,
+				RenderWidth = dispatch.RenderWidth,
+				RenderHeight = dispatch.RenderHeight,
+				JitterX = dispatch.JitterX,
+				JitterY = dispatch.JitterY,
+				MotionVectorScaleX = dispatch.MotionVectorScaleX,
+				MotionVectorScaleY = dispatch.MotionVectorScaleY,
+				FrameTimeMs = dispatch.FrameTimeMs,
+				CameraNear = dispatch.CameraNear,
+				CameraFar = dispatch.CameraFar,
+				CameraFovY = dispatch.CameraFovY,
+				InfiniteFar = dispatch.InfiniteFar,
+				Reset = dispatch.Reset,
+				CameraPosition = this.cameraPosition,
+				CameraUp = this.cameraUp,
+				CameraRight = this.cameraRight,
+				CameraForward = this.cameraForward,
+			};
+			this.frameReady = true;
 		}
 		catch (Exception e)
 		{
 			if (!this.loggedEvaluateError)
 			{
 				this.loggedEvaluateError = true;
-				this.Status = $"Error: {e.Message}";
+				this.failure = $"Error: {e.Message}";
 				Service.PluginLog.Error(e, "FSR dispatch failed");
 			}
 

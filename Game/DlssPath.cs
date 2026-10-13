@@ -121,7 +121,7 @@ public unsafe class DlssPath: IDisposable
 	private long lastEvaluate;
 	private bool loggedEvaluateError;
 	private FrameInputs frame;
-	private bool frameReady;
+	private volatile bool frameReady;
 
 	// Render thread sets it when the upscaler can't start or dispatch, the framework thread releases
 	private volatile string? failure;
@@ -130,7 +130,7 @@ public unsafe class DlssPath: IDisposable
 	private (Upscaler, UpscaleMode)? failedSettings;
 
 	// Framework thread
-	private State state = State.Idle;
+	private volatile State state = State.Idle;
 	private bool hooksEnabled;
 	// NGX state of the DLSS object and the render size callback before activation
 	private byte savedFlags;
@@ -383,6 +383,7 @@ public unsafe class DlssPath: IDisposable
 		this.requestedRenderHeight = 0;
 		this.RequestReallocation();
 		this.state = State.Releasing;
+		this.frameReady = false;
 		this.releaseFramesLeft = ReleaseFrames;
 		this.Status = status;
 		this.OutputWidth = 0;
@@ -487,7 +488,7 @@ public unsafe class DlssPath: IDisposable
 	public bool TakeFrame(out FrameInputs frame)
 	{
 		frame = this.frame;
-		bool ready = this.frameReady;
+		bool ready = this.frameReady && this.state == State.Active;
 		this.frameReady = false;
 		return ready;
 	}

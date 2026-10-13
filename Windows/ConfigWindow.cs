@@ -72,6 +72,9 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		if (ImGui.Checkbox("Zero copy (shared render targets)", ref configuration.ZeroCopy))
 			configuration.Save();
 		ImGui.EndDisabled();
+
+		if (ImGui.Checkbox("Frame generation present thread (experimental)", ref configuration.FrameGenerationPresentThread))
+			configuration.Save();
 #endif
 
 		ImGui.EndDisabled();
@@ -122,15 +125,19 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			if (ImGui.IsItemHovered())
 			{
 				ImGui.SetTooltip(
-					"Frames shown per second. The game has to render half of it, with headroom: its frame has to be built\n" +
-					"in half a rendered frame. Targets that don't divide the refresh rate need a variable refresh display.");
+					"Frames shown per second. The game has to render half of it, with headroom: each frame has to be built\n" +
+					"within a rendered frame. Targets that don't divide the refresh rate need a variable refresh display.");
 			}
 		}
 
 		// Each real frame waits half a rendered frame behind the generated one, plus about 1 ms of generation
 		int rendered = framePacer.GenerationRate;
 		if (rendered > 0)
+		{
 			ImGui.TextDisabled($"Rendering {rendered} fps, showing {rendered * 2} fps, adds about {(500 / rendered) + 1} ms of latency");
+			ImGui.TextDisabled(framePacer.PresentsOnThread ? "Frames are presented on their own thread" : "Frames are presented on the game's thread");
+		}
+
 		if (!framePacer.KeepingUp)
 		{
 			int sustained = framePacer.SustainedTarget;

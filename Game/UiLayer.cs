@@ -34,9 +34,6 @@ namespace UpscaleBuddy.Game;
 /// </summary>
 public unsafe class UiLayer: IDisposable
 {
-	// RenderTargetManager, Kernel::Texture* the UI is drawn on: the back buffer, or ToneAdjustSource (RTM+0x4E8) with ToneAdjust on
-	private const int FinalTargetOffset = 0x570;
-
 	// PostEffectManager+0x1B0: ToneAdjust, input PostEffectManager+0x4028 (= ToneAdjustSource), output +0x4020 (final)
 	private const int ToneAdjustChainOffset = 0x1B0;
 	private const int ChainInputOffset = 0x18; // PostEffectChain, Kernel::Texture*
@@ -49,28 +46,22 @@ public unsafe class UiLayer: IDisposable
 	private const TextureFlags TargetFlags = TextureFlags.TextureRenderTarget | TextureFlags.ReadWrite | TextureFlags.UserManaged;
 	private const uint AllocationClass = 3;
 
-	// Callback command (ImmediateContextDX11.ExecuteCommands type 0xE): fn +0x8, arg +0x10, flags +0x18; ours carries its
-	// arguments after it, in the command buffer, alive until executed
-	private const uint CallbackCommandType = 0xE;
+	// Callback command (RenderCommandType.Callback): fn +0x8, arg +0x10, flags +0x18; ours carries its arguments after it, in
+	// the command buffer, alive until executed
+	private const uint CallbackCommandType = (uint)RenderCommandType.Callback;
 	private const int CallbackSize = 0x20;
 	private const int ToneAdjustView = 31;
 	private const uint BeforeToneAdjust = 0x0FFFFFFE;
 	private const uint AfterToneAdjust = 0x0FFFFFFF; // Same key as ToneAdjust, queued later so sorted after it
 	private const int ContextSubViewFlagOffset = 0x2F70; // Context: when 0 the top nibble of view 31 keys is forced to 0xF
 
-	private delegate void SetBlendStateDelegate(ImmediateContext* context, uint state);
-	private delegate void SetTargetDelegate(ImmediateContext* context, nint command);
-
-	// RenderCommandSetTarget: render targets 0-4 from +0x8, depth stencil +0x30 (CommandSetRenderTarget)
-	private const int CommandTargetOffset = 0x8;
-	private const int CommandDepthOffset = 0x30;
 	private delegate void CallbackDelegate(nint* arguments);
 
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly FrameGenerationRunner runner;
 	private readonly Hook<AtkServer.Delegates.Draw>? drawHook;
-	private readonly Hook<SetBlendStateDelegate>? setBlendStateHook;
-	private readonly Hook<SetTargetDelegate>? setTargetHook;
+	private readonly Hook<ImmediateContext.Delegates.SetBlendState>? setBlendStateHook;
+	private readonly Hook<ImmediateContext.Delegates.DoSetTargetCommand>? setTargetHook;
 
 	// Main thread sets it at the UI pass: the final target, whose binds with a depth buffer are nameplates
 	private volatile nint finalTarget;
@@ -118,9 +109,9 @@ public unsafe class UiLayer: IDisposable
 			this.renderChain = (delegate* unmanaged<PostEffectChain*, void>)Service.SigScanner.ScanText(RenderChainSignature);
 			this.drawHook = Service.GameInteropProvider.HookFromAddress<AtkServer.Delegates.Draw>(
 				(nint)AtkServer.MemberFunctionPointers.Draw, this.DrawDetour);
-			this.setBlendStateHook = Service.GameInteropProvider.HookFromAddress<SetBlendStateDelegate>(
+			this.setBlendStateHook = Service.GameInteropProvider.HookFromAddress<ImmediateContext.Delegates.SetBlendState>(
 				(nint)ImmediateContext.MemberFunctionPointers.SetBlendState, this.SetBlendStateDetour);
-			this.setTargetHook = Service.GameInteropProvider.HookFromAddress<SetTargetDelegate>(
+			this.setTargetHook = Service.GameInteropProvider.HookFromAddress<ImmediateContext.Delegates.DoSetTargetCommand>(
 				(nint)ImmediateContext.MemberFunctionPointers.DoSetTargetCommand, this.SetTargetDetour);
 			this.drawHook.Enable();
 			this.setBlendStateHook.Enable();
@@ -153,7 +144,8 @@ public unsafe class UiLayer: IDisposable
 	/// <summary>Main thread, the UI's commands are being built</summary>
 	private void DrawDetour(AtkServer* atkServer, bool flag)
 	{
-		KernelTexture** final = (KernelTexture**)((byte*)RenderTargetManager.Instance() + FinalTargetOffset);
+		// The Kernel::Texture the UI is drawn on: the back buffer, or ToneAdjustSource with ToneAdjust on
+		KernelTexture** final = &RenderTargetManager.Instance()->SwapChainBackBuffer;
 		KernelTexture* target = *final;
 		KernelTexture* ui = null;
 		if (this.runner.Enabled && !this.stopped && target != null)
@@ -284,26 +276,25 @@ public unsafe class UiLayer: IDisposable
 	/// 2D UI), depth tested against the scene. That bind gets the layer as render target 0 instead, the depth stays, so
 	/// they're occluded as before and drawn into the layer like the rest of the UI
 	/// </summary>
-	private void SetTargetDetour(ImmediateContext* context, nint command)
+	private void SetTargetDetour(ImmediateContext* context, RenderCommandSetTarget* command)
 	{
 		nint final = this.finalTarget;
 		nint ui = this.layer;
-		KernelTexture** target = (KernelTexture**)(command + CommandTargetOffset);
-		if (final == 0 || ui == 0 || (nint)target[0] != final || *(KernelTexture**)(command + CommandDepthOffset) == null)
+		if (final == 0 || ui == 0 || (nint)command->RenderTargets[0].Value != final || command->DepthBuffer == null)
 		{
 			this.setTargetHook!.Original(context, command);
 			return;
 		}
 
-		target[0] = (KernelTexture*)ui;
+		command->RenderTargets[0] = (KernelTexture*)ui;
 		this.setTargetHook!.Original(context, command);
-		target[0] = (KernelTexture*)final;
+		command->RenderTargets[0] = (KernelTexture*)final;
 	}
 
 	/// <summary>Render thread, every draw</summary>
-	private void SetBlendStateDetour(ImmediateContext* context, uint state)
+	private void SetBlendStateDetour(ImmediateContext* context, PackedBlendStateDesc state)
 	{
-		// Render target 0 (+0x28, set by CommandSetRenderTarget); Dalamud's ClientStructs has no CurrentRenderTargets yet
+		// Render target 0 (BackBufferReference, obsolete for CurrentRenderTargets)
 		nint ui = this.layer;
 #pragma warning disable CS0618
 		if (ui != 0 && (nint)context->BackBufferReference == ui)
@@ -320,9 +311,8 @@ public unsafe class UiLayer: IDisposable
 	/// Layer = colour + layer * (1 - coverage) for every blend the UI uses, so it composites as premultiplied alpha.
 	/// Coverage follows the colour's destination term: kept for additive, replaced for opaque, (1 - src alpha) otherwise.
 	/// </summary>
-	internal static uint Premultiplied(uint key)
+	internal static PackedBlendStateDesc Premultiplied(PackedBlendStateDesc desc)
 	{
-		PackedBlendStateDesc desc = *(PackedBlendStateDesc*)&key;
 		if (!desc.BlendEnable)
 		{
 			desc.BlendEnable = true;
@@ -337,7 +327,7 @@ public unsafe class UiLayer: IDisposable
 		desc.SrcBlendAlpha = (byte)(additive ? D3D11_BLEND_ZERO : D3D11_BLEND_ONE);
 		desc.DestBlendAlpha = (byte)(additive ? D3D11_BLEND_ONE : replace ? D3D11_BLEND_ZERO : D3D11_BLEND_INV_SRC_ALPHA);
 		desc.RenderTargetWriteMask |= (byte)D3D11_COLOR_WRITE_ENABLE.D3D11_COLOR_WRITE_ENABLE_ALPHA;
-		return *(uint*)&desc;
+		return desc;
 	}
 
 	/// <summary>Render thread, after the UI and before ToneAdjust: scene saved, layer onto the final target</summary>
@@ -421,7 +411,21 @@ public unsafe class UiLayer: IDisposable
 	/// Source over the target, premultiplied alpha blended or copied, in a context state of its own: the game's bindings and
 	/// its state cache stay as they were
 	/// </summary>
-	private void Draw(ID3D11DeviceContext* context, KernelTexture* target, KernelTexture* ui, bool blend)
+	private void Draw(ID3D11DeviceContext* context, KernelTexture* target, KernelTexture* ui, bool blend) =>
+		this.DrawView(context, RenderTarget(target), target->ActualWidth, target->ActualHeight, (ID3D11ShaderResourceView*)ui->D3D11ShaderResourceView, blend);
+
+	/// <summary>The frame generation presenter's copy of a Kernel texture into a texture of its own (the format may differ)</summary>
+	internal void Blit(ID3D11DeviceContext* context, ID3D11RenderTargetView* target, uint width, uint height, ID3D11ShaderResourceView* source) =>
+		this.DrawView(context, target, width, height, source, false);
+
+	/// <summary>The presenter's overlay (premultiplied alpha) over a texture of its own</summary>
+	internal void BlendOver(ID3D11DeviceContext* context, ID3D11RenderTargetView* target, uint width, uint height, ID3D11ShaderResourceView* overlay) =>
+		this.DrawView(context, target, width, height, overlay, true);
+
+	/// <summary>The regenerated frame while there is one, valid once the frame's commands are done</summary>
+	internal KernelTexture* Regenerated => this.stopped ? null : this.regenerated;
+
+	private void DrawView(ID3D11DeviceContext* context, ID3D11RenderTargetView* view, uint width, uint height, ID3D11ShaderResourceView* layerView, bool blend)
 	{
 		if (this.state == null)
 			this.CreateResources(context);
@@ -429,9 +433,7 @@ public unsafe class UiLayer: IDisposable
 		ID3DDeviceContextState* previous;
 		this.context1->SwapDeviceContextState(this.state, &previous);
 
-		ID3D11RenderTargetView* view = RenderTarget(target);
-		ID3D11ShaderResourceView* layerView = (ID3D11ShaderResourceView*)ui->D3D11ShaderResourceView;
-		D3D11_VIEWPORT viewport = new() { Width = target->ActualWidth, Height = target->ActualHeight, MaxDepth = 1 };
+		D3D11_VIEWPORT viewport = new() { Width = width, Height = height, MaxDepth = 1 };
 		context->OMSetRenderTargets(1, &view, null);
 		context->OMSetBlendState(blend ? this.blendState : null, null, uint.MaxValue);
 		context->RSSetViewports(1, &viewport);

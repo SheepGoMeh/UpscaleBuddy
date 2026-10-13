@@ -46,5 +46,9 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	// Frames shown per second with frame generation, 0 = the display's refresh rate
 	public int FrameGenerationTarget;
 
+	// Frame generation presents from a thread of its own instead of the game's, which leaves its frame work the whole rendered
+	// frame; only shown in Debug builds
+	public bool FrameGenerationPresentThread;
+
 	public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }

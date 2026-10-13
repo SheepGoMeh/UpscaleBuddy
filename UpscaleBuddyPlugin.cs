@@ -62,6 +62,10 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		Service.PluginInterface.UiBuilder.OpenConfigUi -= this.configWindow.Toggle;
 		this.windowSystem.RemoveAllWindows();
 
+		// The present thread and the back buffer texture are handed back at a Present, where the render thread is idle
+		Service.Framework.RunOnFrameworkThread(this.framePacer.Stop).Wait();
+		Thread.Sleep(200);
+
 		// Present and the tick wait run on the framework thread
 		Service.Framework.RunOnFrameworkThread(this.framePacer.Dispose).Wait();
 

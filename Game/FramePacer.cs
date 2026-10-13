@@ -17,7 +17,8 @@ namespace UpscaleBuddy.Game;
 /// Replaces the game's frame limiter. The game sleeps inside SwapChain.Present after the frame is built, so what
 /// reaches the screen is a whole sleep old. Here the sleep runs after Framework.Tick, before the next message pump and
 /// input read, sized so the frame is done just in time for an absolute Present schedule.
-/// Frame generation: base rate refresh/2, the generated frame presented first and the real one half a frame later.
+/// Frame generation: base rate refresh/2, the generated frame shown first and the real one half a frame later. They go to the
+/// present thread, so the game's frame work gets a whole rendered frame; when that can't run the main thread presents both.
 /// </summary>
 public unsafe class FramePacer: IDisposable
 {
@@ -31,6 +32,10 @@ public unsafe class FramePacer: IDisposable
 
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly UiLayer uiLayer;
+	private readonly PresentThread presenter;
+	private readonly Action noopPresent;
+	private nint noopSwapChain;
+	private volatile bool stopping;
 	private readonly Hook<Framework.Delegates.Tick>? tickHook;
 	private readonly Hook<PresentDelegate>? presentHook;
 
@@ -58,6 +63,8 @@ public unsafe class FramePacer: IDisposable
 	{
 		this.configuration = configuration;
 		this.uiLayer = uiLayer;
+		this.presenter = new PresentThread(uiLayer);
+		this.noopPresent = () => this.presentHook!.Original((SwapChain*)this.noopSwapChain);
 		try
 		{
 			this.tickHook = Service.GameInteropProvider.HookFromAddress<Framework.Delegates.Tick>(
@@ -83,9 +90,9 @@ public unsafe class FramePacer: IDisposable
 	public bool KeepingUp { get; private set; } = true;
 
 	/// <summary>
-	/// The target the recent frames would hold. Half a rendered frame each: the first Present, then the next frame's work
-	/// and the second Present; shown at 1 / the longer of the two at most, from the slowest of the last frames. Includes
-	/// what others spend inside Present (overlays, capture tools)
+	/// The target the recent frames would hold, from the slowest of the last frames: shown at twice the rate one frame's work
+	/// allows. With the present thread that's the frame's work; when the main thread presents both frames, half a rendered
+	/// frame each: the first Present, then the next frame's work and the second Present
 	/// </summary>
 	public int SustainedTarget
 	{
@@ -95,6 +102,9 @@ public unsafe class FramePacer: IDisposable
 			return slowest > 0 ? (int)(Stopwatch.Frequency / slowest) & ~1 : 0;
 		}
 	}
+
+	/// <summary>Frame generation's presents run on the present thread; false when the game's thread makes them</summary>
+	public bool PresentsOnThread => this.presenter.Active;
 
 	/// <summary>The display's refresh rate, 0 when unknown</summary>
 	public int RefreshRate
@@ -134,6 +144,16 @@ public unsafe class FramePacer: IDisposable
 		Device* device = Device.Instance();
 		int generated = this.configuration.FrameGeneration ? this.GeneratedRate(device) : 0;
 		bool generate = generated != 0;
+		bool threaded = generate && this.configuration.FrameGenerationPresentThread && !this.stopping;
+
+		// The game's own Present needs the game's back buffer texture, on every path below
+		if (!threaded)
+		{
+			this.presenter.ResetFailure();
+			if (this.presenter.Active)
+				this.presenter.Release();
+		}
+
 		int rate = generate ? generated : this.LimitedRate(device);
 		if (swapChain != device->SwapChain || rate == 0)
 		{
@@ -161,6 +181,9 @@ public unsafe class FramePacer: IDisposable
 		if (this.deadline == 0 || now - this.deadline > period)
 			this.deadline = now;
 
+		if (threaded && this.PresentOnThread(device, swapChain, period, now, frameWork))
+			return;
+
 		Wait(this.deadline);
 
 		// Cap 0 skips the game's sleep, preset 1 is sync interval 1
@@ -185,6 +208,37 @@ public unsafe class FramePacer: IDisposable
 		this.deadline += period;
 		this.presented = true;
 	}
+
+	/// <summary>
+	/// The frame goes to the present thread, which shows the generated one at the deadline and this one half a rendered frame later.
+	/// The game's own Present then only runs for Dalamud, which draws on the main thread while the render thread is idle (its
+	/// plugins' Draw callbacks have to stay on it), so the work here has the whole rendered frame
+	/// </summary>
+	private bool PresentOnThread(Device* device, SwapChain* swapChain, long period, long now, long frameWork)
+	{
+		if (!this.presenter.Handoff(device, swapChain, this.uiLayer.Regenerated, this.deadline, period, now))
+			return false;
+
+		uint preset = device->FrameRateLimitPresetPresent;
+		ushort cap = device->FrameRateLimitPresent;
+		device->FrameRateLimitPresent = 0;
+		device->FrameRateLimitPresetPresent = 0;
+		this.noopSwapChain = (nint)swapChain;
+		this.presenter.NoopPresent(this.noopPresent);
+		device->FrameRateLimitPresetPresent = preset;
+		device->FrameRateLimitPresent = cap;
+		this.presenter.Commit();
+
+		// The estimate's unit is half a rendered frame
+		this.halves[this.halfIndex] = frameWork / 2;
+		this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
+		this.deadline += period;
+		this.presented = true;
+		return true;
+	}
+
+	/// <summary>Framework thread: the present thread and the back buffer texture are handed back at the next Present</summary>
+	public void Stop() => this.stopping = true;
 
 	private void TrackHeadroom(bool missed)
 	{
@@ -274,7 +328,7 @@ public unsafe class FramePacer: IDisposable
 
 	private long PredictedWork() => this.work.Max() + Margin;
 
-	private static void Wait(long until)
+	internal static void Wait(long until)
 	{
 		long now = Stopwatch.GetTimestamp();
 		while (until - now > SpinTicks)
@@ -294,6 +348,7 @@ public unsafe class FramePacer: IDisposable
 	{
 		this.tickHook?.Dispose();
 		this.presentHook?.Dispose();
+		this.presenter.Dispose();
 		Dx.Release(this.held);
 		this.held = null;
 		GC.SuppressFinalize(this);

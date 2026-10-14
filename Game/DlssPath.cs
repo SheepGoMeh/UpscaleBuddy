@@ -62,6 +62,9 @@ public unsafe class DlssPath: IDisposable
 	private const byte UpscaleTypeDlss = 2;
 	private const uint SettingAmdFsr = 0; // GraphicsRezoUpscaleType: 0 AMD FSR, 1 NVIDIA DLSS
 	private const int NgxFeatureFlagDepthInverted = 0x8;
+	private const int ResetFramesAfterTerritoryChange = 3;
+	private const int MaxRestarts = 3;
+	private const double RestartWindowSeconds = 60;
 	private const int MaxRejections = 10;
 	private const int ReleaseFrames = 3;
 
@@ -104,6 +107,7 @@ public unsafe class DlssPath: IDisposable
 	private volatile bool sharpen;
 	private volatile float sharpness;
 	private volatile bool measure;
+	private volatile int resetFrames;
 	private volatile float cameraNear = 0.1f;
 	private volatile float cameraFar = 1000.0f;
 	private volatile float cameraFov = 1.0f;
@@ -128,6 +132,9 @@ public unsafe class DlssPath: IDisposable
 
 	// Framework thread: the settings that failed, not retried until they change
 	private (Upscaler, UpscaleMode)? failedSettings;
+
+	// Framework thread: when the upscaler was restarted after a failure
+	private readonly Queue<long> restarts = new();
 
 	// Framework thread
 	private volatile State state = State.Idle;
@@ -193,6 +200,28 @@ public unsafe class DlssPath: IDisposable
 				Service.PluginLog.Warning(e, "Zero copy unavailable, the AMD DLL path copies its inputs");
 			}
 		}
+
+		Service.ClientState.TerritoryChanged += this.OnTerritoryChanged;
+	}
+
+	/// <summary>
+	/// A new area is a cut: the upscalers' history of the previous one has to go, a bad value from the loading transition can
+	/// otherwise stay in it and keep the scene black (the UI, composited separately, stays). Framework thread
+	/// </summary>
+	private void OnTerritoryChanged(uint territory)
+	{
+		this.resetFrames = ResetFramesAfterTerritoryChange;
+	}
+
+	/// <summary>Render thread: whether this frame resets the upscaler history after a territory change</summary>
+	private bool TakeResetFrame()
+	{
+		int left = this.resetFrames;
+		if (left <= 0)
+			return false;
+
+		this.resetFrames = left - 1;
+		return true;
 	}
 
 	public bool Available { get; }
@@ -243,11 +272,15 @@ public unsafe class DlssPath: IDisposable
 
 		bool wanted = this.configuration.Mode != UpscaleMode.Off && GameSettingIsFsr();
 
-		// A failed start or dispatch: the game's own upscaler back instead of its render size picture, until the settings change
+		// A failed start or dispatch: first a restart of the upscaler (a fresh D3D12 device and context), and when that keeps failing
+		// the game's own upscaler back instead of its render size picture, until the settings change
 		string? failed = this.failure;
 		if (failed != null && this.state == State.Active)
 		{
 			this.failure = null;
+			if (this.Restart(failed))
+				return;
+
 			this.failedSettings = (this.configuration.Upscaler, this.configuration.Mode);
 			this.BeginRelease($"{failed}. The game's own upscaler is back on; change the upscaler or mode to try again");
 			return;
@@ -276,6 +309,33 @@ public unsafe class DlssPath: IDisposable
 
 		if (this.state == State.Idle && !wanted)
 			this.Status = this.configuration.Mode == UpscaleMode.Off ? "Off" : "Off (the game's upscaler is not AMD FSR)";
+	}
+
+	/// <summary>
+	/// Framework thread: retires the failed upscaler and has the game create the feature again, which builds a new one. History is
+	/// reset for the first frames. False once it has restarted MaxRestarts times within RestartWindowSeconds, the failure is then
+	/// persistent
+	/// </summary>
+	private bool Restart(string reason)
+	{
+		long now = Stopwatch.GetTimestamp();
+		while (this.restarts.Count > 0 && Stopwatch.GetElapsedTime(this.restarts.Peek(), now).TotalSeconds > RestartWindowSeconds)
+			this.restarts.Dequeue();
+
+		if (this.restarts.Count >= MaxRestarts)
+		{
+			Service.PluginLog.Error($"The upscaler failed again ({reason}) after {MaxRestarts} restarts in {RestartWindowSeconds} s, giving up");
+			return false;
+		}
+
+		this.restarts.Enqueue(now);
+		this.RetireUpscaler();
+		this.frameReady = false;
+		this.resetFrames = ResetFramesAfterTerritoryChange;
+		this.InvalidateFeature();
+		this.Status = $"Restarting ({reason})";
+		Service.PluginLog.Warning($"Restarting the upscaler ({this.restarts.Count} of {MaxRestarts}): {reason}");
+		return true;
 	}
 
 	private void Activate()
@@ -685,7 +745,7 @@ public unsafe class DlssPath: IDisposable
 			CameraFar = this.cameraFar,
 			CameraFovY = this.cameraFov,
 			InfiniteFar = this.infiniteFar,
-			Reset = this.parameters.Number("Reset") != 0,
+			Reset = this.parameters.Number("Reset") != 0 || this.TakeResetFrame(),
 			Sharpen = this.sharpen,
 			Sharpness = this.sharpness,
 			Measure = this.measure,
@@ -771,6 +831,13 @@ public unsafe class DlssPath: IDisposable
 	/// </summary>
 	private int ReleaseDetour(nint handle)
 	{
+		this.RetireUpscaler();
+		return NgxParameters.Success;
+	}
+
+	/// <summary>Hands the upscaler and downsampler over to the render thread, which disposes them</summary>
+	private void RetireUpscaler()
+	{
 		lock (this.upscalerLock)
 		{
 			if (this.upscaler != null)
@@ -780,8 +847,6 @@ public unsafe class DlssPath: IDisposable
 			this.upscaler = null;
 			this.downsampler = null;
 		}
-
-		return NgxParameters.Success;
 	}
 
 	private void DisposeRetired()
@@ -825,6 +890,7 @@ public unsafe class DlssPath: IDisposable
 		this.shutdownHook?.Dispose();
 		this.renderSizeHook?.Dispose();
 		this.sharedTargets?.Dispose();
+		Service.ClientState.TerritoryChanged -= this.OnTerritoryChanged;
 
 		lock (this.upscalerLock)
 		{

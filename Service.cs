@@ -19,4 +19,6 @@ public class Service
 	[PluginService] public static IPluginLog PluginLog { get; set; } = null!;
 
 	[PluginService] public static IGameConfig GameConfig { get; set; } = null!;
+
+	[PluginService] public static IClientState ClientState { get; set; } = null!;
 }

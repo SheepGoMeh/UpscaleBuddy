@@ -19,6 +19,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 	private readonly DlssPath dlssPath;
 	private readonly FrameGenerationRunner frameGeneration;
 	private readonly UiLayer uiLayer;
+	private readonly RenderFrameHook renderFrames;
 	private readonly FramePacer framePacer;
 	private readonly WindowSystem windowSystem;
 	private readonly ConfigWindow configWindow;
@@ -33,7 +34,8 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		this.dlssPath = new DlssPath(this.configuration);
 		this.frameGeneration = new FrameGenerationRunner(this.configuration, this.dlssPath);
 		this.uiLayer = new UiLayer(this.configuration, this.frameGeneration);
-		this.framePacer = new FramePacer(this.configuration, this.uiLayer);
+		this.renderFrames = new RenderFrameHook();
+		this.framePacer = new FramePacer(this.configuration, this.uiLayer, this.renderFrames);
 
 		this.windowSystem = new WindowSystem("UpscaleBuddy");
 		this.configWindow = new ConfigWindow(this.configuration, this.dlssPath, this.framePacer, this.uiLayer, this.frameGeneration);
@@ -79,6 +81,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		Service.Framework.RunOnFrameworkThread(() =>
 		{
 			this.dlssPath.Finish();
+			this.renderFrames.Dispose();
 			this.uiLayer.Dispose();
 			this.frameGeneration.Dispose();
 		}).Wait();

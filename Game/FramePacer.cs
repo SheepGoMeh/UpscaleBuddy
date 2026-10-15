@@ -32,6 +32,7 @@ public unsafe class FramePacer: IDisposable
 
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly UiLayer uiLayer;
+	private readonly RenderFrameHook renderFrames;
 	private readonly PresentThread presenter;
 	private readonly Action noopPresent;
 	private nint noopSwapChain;
@@ -59,12 +60,15 @@ public unsafe class FramePacer: IDisposable
 	private int lateIndex;
 	private int lateCount;
 
-	public FramePacer(UpscaleBuddyConfiguration configuration, UiLayer uiLayer)
+	public FramePacer(UpscaleBuddyConfiguration configuration, UiLayer uiLayer, RenderFrameHook renderFrames)
 	{
 		this.configuration = configuration;
 		this.uiLayer = uiLayer;
+		this.renderFrames = renderFrames;
 		this.presenter = new PresentThread(uiLayer);
-		this.noopPresent = () => this.presentHook!.Original((SwapChain*)this.noopSwapChain);
+		renderFrames.Started += this.presenter.Started;
+		renderFrames.Finished += this.presenter.Publish;
+		this.noopPresent = () => this.CallOriginal((SwapChain*)this.noopSwapChain);
 		try
 		{
 			this.tickHook = Service.GameInteropProvider.HookFromAddress<Framework.Delegates.Tick>(
@@ -139,12 +143,15 @@ public unsafe class FramePacer: IDisposable
 		return result;
 	}
 
+	/// <summary>The game's Present, with Dalamud's detour inside</summary>
+	private void CallOriginal(SwapChain* swapChain) => this.presentHook!.Original(swapChain);
+
 	private void PresentDetour(SwapChain* swapChain)
 	{
 		Device* device = Device.Instance();
 		int generated = this.configuration.FrameGeneration ? this.GeneratedRate(device) : 0;
 		bool generate = generated != 0;
-		bool threaded = generate && this.configuration.FrameGenerationPresentThread && !this.stopping;
+		bool threaded = generate && !this.stopping;
 
 		// The game's own Present needs the game's back buffer texture, on every path below
 		if (!threaded)
@@ -159,7 +166,7 @@ public unsafe class FramePacer: IDisposable
 		{
 			this.deadline = 0;
 			this.ResetHeadroom();
-			this.presentHook!.Original(swapChain);
+			this.CallOriginal(swapChain);
 			return;
 		}
 
@@ -181,7 +188,7 @@ public unsafe class FramePacer: IDisposable
 		if (this.deadline == 0 || now - this.deadline > period)
 			this.deadline = now;
 
-		if (threaded && this.PresentOnThread(device, swapChain, period, now, frameWork))
+		if (threaded && this.PresentOnThread(device, swapChain, period, frameWork))
 			return;
 
 		Wait(this.deadline);
@@ -199,7 +206,7 @@ public unsafe class FramePacer: IDisposable
 		}
 		else
 		{
-			this.presentHook!.Original(swapChain);
+			this.CallOriginal(swapChain);
 		}
 
 		device->FrameRateLimitPresetPresent = preset;
@@ -210,13 +217,14 @@ public unsafe class FramePacer: IDisposable
 	}
 
 	/// <summary>
-	/// The frame goes to the present thread, which shows the generated one at the deadline and this one half a rendered frame later.
-	/// The game's own Present then only runs for Dalamud, which draws on the main thread while the render thread is idle (its
-	/// plugins' Draw callbacks have to stay on it), so the work here has the whole rendered frame
+	/// The render thread publishes the frame it kicks here to the present thread, which shows the generated one a render time
+	/// after the deadline and this one half a rendered frame later. The game's own Present then only runs for Dalamud, which draws
+	/// on the main thread while the render thread is idle (its plugins' Draw callbacks have to stay on it), so the work here has
+	/// the whole rendered frame
 	/// </summary>
-	private bool PresentOnThread(Device* device, SwapChain* swapChain, long period, long now, long frameWork)
+	private bool PresentOnThread(Device* device, SwapChain* swapChain, long period, long frameWork)
 	{
-		if (!this.presenter.Handoff(device, swapChain, this.uiLayer.Regenerated, this.deadline, period, now))
+		if (!this.presenter.Prepare(device, swapChain, this.deadline, period))
 			return false;
 
 		uint preset = device->FrameRateLimitPresetPresent;
@@ -227,7 +235,6 @@ public unsafe class FramePacer: IDisposable
 		this.presenter.NoopPresent(this.noopPresent);
 		device->FrameRateLimitPresetPresent = preset;
 		device->FrameRateLimitPresent = cap;
-		this.presenter.Commit();
 
 		// The estimate's unit is half a rendered frame
 		this.halves[this.halfIndex] = frameWork / 2;
@@ -297,13 +304,13 @@ public unsafe class FramePacer: IDisposable
 		long start = Stopwatch.GetTimestamp();
 		context->CopyResource((ID3D11Resource*)this.held, (ID3D11Resource*)backBuffer);
 		this.uiLayer.CopyRegenerated(swapChain);
-		this.presentHook!.Original(swapChain);
+		this.CallOriginal(swapChain);
 		long first = Stopwatch.GetTimestamp() - start;
 
 		context->CopyResource((ID3D11Resource*)backBuffer, (ID3D11Resource*)this.held);
 		Wait(this.deadline + period / 2);
 		start = Stopwatch.GetTimestamp();
-		this.presentHook!.Original(swapChain);
+		this.CallOriginal(swapChain);
 		return (first, Stopwatch.GetTimestamp() - start);
 	}
 
@@ -346,6 +353,8 @@ public unsafe class FramePacer: IDisposable
 
 	public void Dispose()
 	{
+		this.renderFrames.Started -= this.presenter.Started;
+		this.renderFrames.Finished -= this.presenter.Publish;
 		this.tickHook?.Dispose();
 		this.presentHook?.Dispose();
 		this.presenter.Dispose();

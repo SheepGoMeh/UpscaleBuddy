@@ -72,9 +72,6 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		if (ImGui.Checkbox("Zero copy (shared render targets)", ref configuration.ZeroCopy))
 			configuration.Save();
 		ImGui.EndDisabled();
-
-		if (ImGui.Checkbox("Frame generation present thread (experimental)", ref configuration.FrameGenerationPresentThread))
-			configuration.Save();
 #endif
 
 		ImGui.EndDisabled();
@@ -136,6 +133,8 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		{
 			ImGui.TextDisabled($"Rendering {rendered} fps, showing {rendered * 2} fps, adds about {(500 / rendered) + 1} ms of latency");
 			ImGui.TextDisabled(framePacer.PresentsOnThread ? "Frames are presented on their own thread" : "Frames are presented on the game's thread");
+			if (configuration.ShowTimings && frameGeneration.Timings.Length > 0)
+				ImGui.TextDisabled($"Frame generation per frame: {frameGeneration.Timings}");
 		}
 
 		if (!framePacer.KeepingUp)

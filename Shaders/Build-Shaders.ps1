@@ -93,6 +93,11 @@ foreach ($stage in @('vs', 'ps')) {
 	Write-Host "ui_composite_$stage : built"
 }
 
+# ToneAdjust's gamma on the presenter's composed frame, Game/UiLayer.cs (drawn with ui_composite_vs)
+& $Fxc /nologo /T ps_5_0 /E PS /O3 /Fo (Join-Path $out 'tone_adjust_ps.cso') (Join-Path $PSScriptRoot 'tone_adjust.hlsl') | Where-Object { $_ -match 'error' }
+if ($LASTEXITCODE -ne 0) { throw "fxc failed for tone_adjust" }
+Write-Host "tone_adjust_ps : built"
+
 # AMD's signed FSR DLLs (FSR 4 where supported, FSR 3.1 elsewhere), loaded by Ffx/FfxBackend.cs and Ffx/FfxFrameGenerator.cs
 foreach ($name in @('amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'amd_fidelityfx_framegeneration_dx12.dll')) {
 	Copy-Item (Join-Path $kit "signedbin\$name") $out

@@ -224,10 +224,10 @@ public unsafe class FramePacer: IDisposable
 	/// </summary>
 	private bool PresentOnThread(Device* device, SwapChain* swapChain, long period, long frameWork)
 	{
-		if (!this.presenter.Prepare(device, swapChain, this.deadline, period))
+		uint preset = device->FrameRateLimitPresetPresent;
+		if (!this.presenter.Prepare(device, swapChain, this.deadline, period, preset != 0))
 			return false;
 
-		uint preset = device->FrameRateLimitPresetPresent;
 		ushort cap = device->FrameRateLimitPresent;
 		device->FrameRateLimitPresent = 0;
 		device->FrameRateLimitPresetPresent = 0;

@@ -89,6 +89,10 @@ internal sealed unsafe class PresentThread: IDisposable
 	private ID3D11Device* device;
 	private ID3D11DeviceContext* context;
 	private IDXGISwapChain1* swapChain;
+	private IDXGIOutput* output;
+
+	// The game's vsync setting: a frame is shown right after a vblank, so its flip can't tear mid image
+	private volatile bool vsync;
 	private ID3D11Texture2D* buffer;
 	private ID3D11RenderTargetView* bufferView;
 	private KernelTexture* backBuffer;
@@ -161,8 +165,10 @@ internal sealed unsafe class PresentThread: IDisposable
 	/// </summary>
 	/// <param name="deadline">When the frame about to be kicked is meant to be done</param>
 	/// <param name="period">One rendered frame</param>
-	public bool Prepare(Device* kernelDevice, SwapChain* kernelSwapChain, long deadline, long period)
+	/// <param name="vsync">Whether the game's frame rate setting syncs to the display</param>
+	public bool Prepare(Device* kernelDevice, SwapChain* kernelSwapChain, long deadline, long period, bool vsync)
 	{
+		this.vsync = vsync;
 		if (this.active && (kernelSwapChain->BackBuffer != this.backBuffer || kernelSwapChain->BackBuffer->ActualWidth != this.width
 			|| kernelSwapChain->BackBuffer->ActualHeight != this.height))
 			this.Release();
@@ -389,6 +395,9 @@ internal sealed unsafe class PresentThread: IDisposable
 		try
 		{
 			this.swapChain = Dx.Query<IDXGISwapChain1>(kernelSwapChain->DXGISwapChain);
+			IDXGIOutput* containing;
+			if (this.swapChain->GetContainingOutput(&containing).SUCCEEDED)
+				this.output = containing;
 			ID3D11Texture2D* swapChainBuffer;
 			ThrowIfFailed(this.swapChain->GetBuffer(0, __uuidof<ID3D11Texture2D>(), (void**)&swapChainBuffer));
 			this.buffer = swapChainBuffer;
@@ -518,7 +527,8 @@ internal sealed unsafe class PresentThread: IDisposable
 
 			// Woke far too late (or the frame was): presenting right behind the previous one would only look worse. A frame whose ring
 			// slot the render thread is about to reuse is gone
-			if (late > this.period / 4 || Volatile.Read(ref this.published) - entry.Frame >= Ring)
+			// The vblank wait of the previous frame makes up to a refresh of lateness, which isn't one
+			if (late > (this.vsync ? this.period / 2 : this.period / 4) || Volatile.Read(ref this.published) - entry.Frame >= Ring)
 				continue;
 
 			// The generator has until a quarter of a period after the due time; the CPU waits here, the game's queue never does
@@ -532,6 +542,10 @@ internal sealed unsafe class PresentThread: IDisposable
 				this.LearnGenerationLag(ready ? Stopwatch.GetTimestamp() - waitStart : budget);
 			}
 
+			// No lock is held while waiting: the main thread's Present re-shows the frame on screen meanwhile
+			if (this.vsync)
+				this.WaitForVBlank();
+
 			lock (this.presentLock)
 			{
 				if (ticket != null)
@@ -541,6 +555,18 @@ internal sealed unsafe class PresentThread: IDisposable
 				this.lastShownFrame = entry.Frame;
 				this.lastShown = entry.Texture;
 			}
+		}
+	}
+
+	/// <summary>Blocks until the display's next vblank; an output that can't wait is given up on and frames go out unsynced</summary>
+	private void WaitForVBlank()
+	{
+		IDXGIOutput* waiting = this.output;
+		if (waiting != null && waiting->WaitForVBlank().FAILED)
+		{
+			Service.PluginLog.Warning("Waiting for the display's vblank failed, frames are presented unsynced");
+			Dx.Release(waiting);
+			this.output = null;
 		}
 	}
 
@@ -653,6 +679,7 @@ internal sealed unsafe class PresentThread: IDisposable
 		Dx.Release(this.ours);
 		Dx.Release(this.bufferView);
 		Dx.Release(this.buffer);
+		Dx.Release(this.output);
 		Dx.Release(this.swapChain);
 		Dx.Release(this.context);
 		Dx.Release(this.device);
@@ -664,6 +691,7 @@ internal sealed unsafe class PresentThread: IDisposable
 		this.bufferView = null;
 		this.buffer = null;
 		this.swapChain = null;
+		this.output = null;
 		this.context = null;
 		this.device = null;
 		this.lastShown = -1;

@@ -93,7 +93,10 @@ public unsafe class GpuTimer: IDisposable
 		}
 
 		for (int i = 0; i < this.Ms.Length; i++)
-			this.Ms[i] = (this.Ms[i] * 0.9) + ((stamps[i + 1] - stamps[i]) * 1000.0 / disjoint.Frequency * 0.1);
+		{
+			double ms = (stamps[i + 1] - stamps[i]) * 1000.0 / disjoint.Frequency;
+			this.Ms[i] = (this.Ms[i] * 0.9) + (ms * 0.1);
+		}
 	}
 
 	public void Dispose()

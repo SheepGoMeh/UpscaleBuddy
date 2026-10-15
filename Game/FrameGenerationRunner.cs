@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 
 using TerraFX.Interop.DirectX;
 
@@ -15,48 +16,80 @@ namespace UpscaleBuddy.Game;
 /// </summary>
 public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuration, DlssPath dlssPath): IDisposable
 {
+	private const double LogSeconds = 5;
+	private const uint BakedWaitMs = 100;
+
 	private IFrameGenerator? generator;
+	private long lastLog;
 	private uint width, height, maxRenderWidth, maxRenderHeight;
 	private bool failed;
 
 	public string Status { get; private set; } = "Off";
 
+	/// <summary>Where the game's queue spends its time generating, while timings are shown</summary>
+	public string Timings => this.generator?.Timings ?? "";
+
 	public bool Enabled => configuration.FrameGeneration;
 
-	/// <summary>The frame between the previous scene and this one into output; false when there's nothing to generate from</summary>
-	public bool Generate(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* output)
+	/// <summary>
+	/// The frame between the previous scene and this one is generated off this thread; null when there's nothing to generate from
+	/// or the generator is behind (its next frame starts over)
+	/// </summary>
+	public GenerationTicket? Submit(ID3D11DeviceContext* context, KernelTexture* scene)
 	{
 		if (!configuration.FrameGeneration)
 		{
 			this.failed = false;
 			this.Release("Off");
-			return false;
+			return null;
 		}
 
 		if (!dlssPath.TakeFrame(out FrameInputs inputs) || inputs.Depth == null || inputs.MotionVectors == null)
 		{
 			this.Status = "Waiting for the upscaler (needs the game's resolution scaling on AMD FSR)";
-			return false;
+			return null;
 		}
 
 		if (this.failed)
-			return false;
+			return null;
 
 		inputs.Scene = (ID3D11Texture2D*)scene->D3D11Texture2D;
+		inputs.Measure = configuration.ShowTimings;
 		try
 		{
 			this.Fit(context, scene->ActualWidth, scene->ActualHeight, inputs);
-			this.generator!.Generate(context, inputs, (ID3D11Texture2D*)output->D3D11Texture2D);
+			GenerationTicket? ticket = this.generator!.Submit(context, inputs);
 			this.Status = $"On, {this.generator.Name}";
-			return true;
+			if (inputs.Measure && Stopwatch.GetElapsedTime(this.lastLog).TotalSeconds >= LogSeconds)
+			{
+				this.lastLog = Stopwatch.GetTimestamp();
+				Service.PluginLog.Information("Frame generation timing: " + this.generator.Timings);
+			}
+
+			return ticket;
 		}
 		catch (Exception e)
 		{
 			this.failed = true;
 			this.Release($"Failed: {e.Message}");
 			Service.PluginLog.Error(e, "Frame generation failed, repeating frames until it's turned off and on again");
-			return false;
+			return null;
 		}
+	}
+
+	/// <summary>Baked frames: <see cref="Submit"/>, then this thread waits for the frame and copies it into output; false when there's none</summary>
+	public bool Generate(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* output)
+	{
+		GenerationTicket? ticket = this.Submit(context, scene);
+		if (ticket == null)
+			return false;
+
+		if (!ticket.Wait(BakedWaitMs) || !ticket.TryAcquire(context))
+			return false;
+
+		context->CopyResource((ID3D11Resource*)output->D3D11Texture2D, (ID3D11Resource*)ticket.Output);
+		ticket.Release();
+		return true;
 	}
 
 	private void Fit(ID3D11DeviceContext* context, uint sceneWidth, uint sceneHeight, in FrameInputs inputs)

@@ -12,6 +12,7 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Render;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 
 using TerraFX.Interop.DirectX;
+using TerraFX.Interop.Windows;
 
 using UpscaleBuddy.D3D12;
 using UpscaleBuddy.Ffx;
@@ -61,6 +62,8 @@ public unsafe class DlssPath: IDisposable
 	private const byte UpscaleTypeFsr = 1;
 	private const byte UpscaleTypeDlss = 2;
 	private const uint SettingAmdFsr = 0; // GraphicsRezoUpscaleType: 0 AMD FSR, 1 NVIDIA DLSS
+	private const uint SettingNvidiaDlss = 1;
+	private const uint NvidiaVendorId = 0x10DE;
 	private const int NgxFeatureFlagDepthInverted = 0x8;
 	private const int ResetFramesAfterTerritoryChange = 3;
 	private const int MaxRestarts = 3;
@@ -139,6 +142,10 @@ public unsafe class DlssPath: IDisposable
 	// Framework thread
 	private volatile State state = State.Idle;
 	private bool hooksEnabled;
+
+	// The game's own NGX runs; only the evaluate hook is on, to read the frame's inputs for frame generation
+	private volatile bool nativeHooked;
+	private bool supportChecked;
 	// NGX state of the DLSS object and the render size callback before activation
 	private byte savedFlags;
 	private nint savedParameters;
@@ -236,7 +243,16 @@ public unsafe class DlssPath: IDisposable
 
 	public uint OutputHeight { get; private set; }
 
-	public bool Running => this.state == State.Active && this.OutputWidth != 0;
+	public bool Running => (this.state == State.Active || this.nativeHooked) && this.OutputWidth != 0;
+
+	/// <summary>
+	/// An NVIDIA GPU the game itself made its DLSS object for, so its NGX works; the DLSS entry is only offered then. Known once the
+	/// renderer is up
+	/// </summary>
+	public bool NativeDlssSupported { get; private set; }
+
+	/// <summary>The upscaler the shim uses: DLSS isn't one of its backends</summary>
+	private Upscaler ShimUpscaler => this.configuration.Upscaler == Upscaler.NvidiaDlss ? Upscaler.BuiltInFsr3 : this.configuration.Upscaler;
 
 	public double CpuMs { get; private set; }
 
@@ -262,6 +278,77 @@ public unsafe class DlssPath: IDisposable
 	private static bool GameSettingIsFsr() =>
 		Service.GameConfig.TryGet(SystemConfigOption.GraphicsRezoUpscaleType, out uint value) && value == SettingAmdFsr;
 
+	private static bool GameSettingIsDlss() =>
+		Service.GameConfig.TryGet(SystemConfigOption.GraphicsRezoUpscaleType, out uint value) && value == SettingNvidiaDlss;
+
+	/// <summary>
+	/// The game makes its DLSS object only for a GPU it finds DLSS capable, so the object's existence before the shim allocated its
+	/// own, on an NVIDIA adapter (a leftover shim object on another vendor's GPU doesn't count)
+	/// </summary>
+	private void CheckNativeSupport()
+	{
+		byte* postEffectManager = (byte*)PostEffectManager.Instance();
+		Device* device = Device.Instance();
+		if (postEffectManager == null || device == null || device->D3D11DeviceContext == null)
+			return;
+
+		this.supportChecked = true;
+		bool gameObject = *(nint*)(postEffectManager + DlssObjectOffset) != 0;
+		this.NativeDlssSupported = gameObject && AdapterVendor((ID3D11DeviceContext*)device->D3D11DeviceContext) == NvidiaVendorId;
+	}
+
+	private static uint AdapterVendor(ID3D11DeviceContext* context)
+	{
+		ID3D11Device* device;
+		context->GetDevice(&device);
+		try
+		{
+			IDXGIDevice* dxgiDevice = Dx.Query<IDXGIDevice>(device);
+			IDXGIAdapter* adapter;
+			HRESULT result = dxgiDevice->GetAdapter(&adapter);
+			dxgiDevice->Release();
+			if (result.FAILED)
+				return 0;
+
+			DXGI_ADAPTER_DESC desc;
+			result = adapter->GetDesc(&desc);
+			adapter->Release();
+			return result.FAILED ? 0 : desc.VendorId;
+		}
+		finally
+		{
+			device->Release();
+		}
+	}
+
+	/// <summary>
+	/// Framework thread: the game's own DLSS runs untouched (its setting, quality and DLAA choice); the evaluate hook only reads the
+	/// frame's inputs, for frame generation
+	/// </summary>
+	private void UpdateNative(bool selected)
+	{
+		bool run = selected && this.configuration.Mode != UpscaleMode.Off && this.state == State.Idle && GameSettingIsDlss();
+		if (run)
+			this.SampleCamera();
+
+		if (run == this.nativeHooked)
+			return;
+
+		this.nativeHooked = run;
+		Toggle(this.evaluateHook, run);
+		this.frameReady = false;
+		if (run)
+		{
+			this.lastEvaluate = 0;
+			this.resetFrames = ResetFramesAfterTerritoryChange;
+			this.Status = "On, NVIDIA DLSS (the game's own)";
+		}
+		else
+		{
+			this.OutputWidth = 0;
+		}
+	}
+
 	/// <summary>
 	/// Framework thread
 	/// </summary>
@@ -270,7 +357,12 @@ public unsafe class DlssPath: IDisposable
 		if (!this.Available)
 			return;
 
-		bool wanted = this.configuration.Mode != UpscaleMode.Off && GameSettingIsFsr();
+		if (!this.supportChecked)
+			this.CheckNativeSupport();
+
+		bool native = this.NativeDlssSupported && this.configuration.Upscaler == Upscaler.NvidiaDlss;
+		this.UpdateNative(native);
+		bool wanted = !native && this.configuration.Mode != UpscaleMode.Off && GameSettingIsFsr();
 
 		// A failed start or dispatch: first a restart of the upscaler (a fresh D3D12 device and context), and when that keeps failing
 		// the game's own upscaler back instead of its render size picture, until the settings change
@@ -307,8 +399,11 @@ public unsafe class DlssPath: IDisposable
 				break;
 		}
 
-		if (this.state == State.Idle && !wanted)
-			this.Status = this.configuration.Mode == UpscaleMode.Off ? "Off" : "Off (the game's upscaler is not AMD FSR)";
+		if (this.state == State.Idle && !wanted && !this.nativeHooked)
+		{
+			this.Status = this.configuration.Mode == UpscaleMode.Off ? "Off" :
+				native ? "Off (the game's upscaler is not NVIDIA DLSS)" : "Off (the game's upscaler is not AMD FSR)";
+		}
 	}
 
 	/// <summary>
@@ -400,10 +495,10 @@ public unsafe class DlssPath: IDisposable
 		this.sharpen = this.configuration.Sharpening;
 		this.sharpness = this.configuration.Sharpness;
 		this.measure = this.configuration.ShowTimings;
-		if (this.selectedUpscaler != this.configuration.Upscaler)
+		if (this.selectedUpscaler != this.ShimUpscaler)
 		{
 			// Next frame creates the feature with the other upscaler
-			this.selectedUpscaler = this.configuration.Upscaler;
+			this.selectedUpscaler = this.ShimUpscaler;
 			this.InvalidateFeature();
 		}
 
@@ -548,7 +643,7 @@ public unsafe class DlssPath: IDisposable
 	public bool TakeFrame(out FrameInputs frame)
 	{
 		frame = this.frame;
-		bool ready = this.frameReady && this.state == State.Active;
+		bool ready = this.frameReady && (this.state == State.Active || this.nativeHooked);
 		this.frameReady = false;
 		return ready;
 	}
@@ -712,6 +807,9 @@ public unsafe class DlssPath: IDisposable
 	/// </summary>
 	private int EvaluateDetour(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
 	{
+		if (this.nativeHooked)
+			return this.EvaluateNative(context, handle, parameterObject, progress);
+
 		this.DisposeRetired();
 
 		long now = Stopwatch.GetTimestamp();
@@ -824,6 +922,58 @@ public unsafe class DlssPath: IDisposable
 		}
 
 		return NgxParameters.Success;
+	}
+
+	/// <summary>
+	/// Render thread, the game's own DLSS: it runs as it is, and the inputs it was given are kept for frame generation (the same
+	/// parameters the shim reads, from the game's real NGX parameter object)
+	/// </summary>
+	private int EvaluateNative(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
+	{
+		int result = this.evaluateHook!.Original(context, handle, parameterObject, progress);
+		if (result != NgxParameters.Success || parameterObject == 0)
+			return result;
+
+		long now = Stopwatch.GetTimestamp();
+		float frameTime = this.lastEvaluate == 0 ? 16.6f : (float)((now - this.lastEvaluate) * 1000.0 / Stopwatch.Frequency);
+		this.lastEvaluate = now;
+
+		ID3D11Texture2D* depth = (ID3D11Texture2D*)NgxParameterReader.Pointer(parameterObject, "Depth");
+		ID3D11Texture2D* motionVectors = (ID3D11Texture2D*)NgxParameterReader.Pointer(parameterObject, "MotionVectors");
+		ID3D11Texture2D* output = (ID3D11Texture2D*)NgxParameterReader.Pointer(parameterObject, "Output");
+		uint renderWidth = (uint)NgxParameterReader.Number(parameterObject, "DLSS.Render.Subrect.Dimensions.Width");
+		uint renderHeight = (uint)NgxParameterReader.Number(parameterObject, "DLSS.Render.Subrect.Dimensions.Height");
+		if (depth == null || motionVectors == null || output == null || renderWidth == 0 || renderHeight == 0)
+			return result;
+
+		D3D11_TEXTURE2D_DESC outputDesc = Dx.GetDesc(output);
+		this.RenderWidth = renderWidth;
+		this.RenderHeight = renderHeight;
+		this.OutputWidth = outputDesc.Width;
+		this.OutputHeight = outputDesc.Height;
+		this.frame = new FrameInputs
+		{
+			Depth = depth,
+			MotionVectors = motionVectors,
+			RenderWidth = renderWidth,
+			RenderHeight = renderHeight,
+			JitterX = (float)NgxParameterReader.Number(parameterObject, "Jitter.Offset.X"),
+			JitterY = (float)NgxParameterReader.Number(parameterObject, "Jitter.Offset.Y"),
+			MotionVectorScaleX = (float)NgxParameterReader.Number(parameterObject, "MV.Scale.X"),
+			MotionVectorScaleY = (float)NgxParameterReader.Number(parameterObject, "MV.Scale.Y"),
+			FrameTimeMs = frameTime,
+			CameraNear = this.cameraNear,
+			CameraFar = this.cameraFar,
+			CameraFovY = this.cameraFov,
+			InfiniteFar = this.infiniteFar,
+			Reset = NgxParameterReader.Number(parameterObject, "Reset") != 0 || this.TakeResetFrame(),
+			CameraPosition = this.cameraPosition,
+			CameraUp = this.cameraUp,
+			CameraRight = this.cameraRight,
+			CameraForward = this.cameraForward,
+		};
+		this.frameReady = true;
+		return result;
 	}
 
 	/// <summary>

@@ -34,14 +34,20 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		"FSR 3.1 (built-in, D3D11)", "AMD FSR (DLL over D3D12, FSR 4 where supported)", "Intel XeSS (DLL over D3D12)",
 	];
 
+	// Only on an NVIDIA GPU the game finds DLSS capable
+	private static readonly Upscaler[] UpscalersWithDlss = [.. Upscalers, Upscaler.NvidiaDlss];
+	private static readonly string[] UpscalerNamesWithDlss = [.. UpscalerNames, "NVIDIA DLSS / DLAA (the game's own)"];
+
 	public override void Draw()
 	{
 		ImGui.BeginDisabled(!dlssPath.Available);
 
-		int upscaler = Array.IndexOf(Upscalers, configuration.Upscaler);
-		if (ImGui.Combo("Upscaler", ref upscaler, UpscalerNames, UpscalerNames.Length))
+		Upscaler[] upscalers = dlssPath.NativeDlssSupported ? UpscalersWithDlss : Upscalers;
+		string[] upscalerNames = dlssPath.NativeDlssSupported ? UpscalerNamesWithDlss : UpscalerNames;
+		int upscaler = Array.IndexOf(upscalers, configuration.Upscaler);
+		if (ImGui.Combo("Upscaler", ref upscaler, upscalerNames, upscalerNames.Length))
 		{
-			configuration.Upscaler = Upscalers[upscaler];
+			configuration.Upscaler = upscalers[upscaler];
 			configuration.Save();
 		}
 
@@ -52,8 +58,11 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			configuration.Save();
 		}
 
-		// XeSS has no sharpening pass
-		ImGui.BeginDisabled(configuration.Upscaler == Upscaler.IntelXess);
+		// XeSS has no sharpening pass, and the game's own DLSS keeps its own settings
+		bool nvidia = configuration.Upscaler == Upscaler.NvidiaDlss;
+		if (nvidia)
+			ImGui.TextDisabled("DLSS/DLAA: quality and DLAA are picked in the game's graphics settings, Mode only turns this on or off.");
+		ImGui.BeginDisabled(configuration.Upscaler == Upscaler.IntelXess || nvidia);
 		if (ImGui.Checkbox("Sharpening (RCAS, FSR only)", ref configuration.Sharpening))
 			configuration.Save();
 
@@ -76,7 +85,8 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 
 		ImGui.EndDisabled();
 
-		ImGui.TextDisabled("Applies while the game's 3D resolution scaling is set to AMD FSR.");
+		ImGui.TextDisabled(nvidia ? "Applies while the game's 3D resolution scaling is set to NVIDIA DLSS." :
+			"Applies while the game's 3D resolution scaling is set to AMD FSR.");
 		ImGui.TextDisabled(dlssPath.Status);
 		if (dlssPath.Running)
 		{

@@ -46,7 +46,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 
 		if (!dlssPath.TakeFrame(out FrameInputs inputs) || inputs.Depth == null || inputs.MotionVectors == null)
 		{
-			this.Status = "Waiting for the upscaler (needs the game's resolution scaling on AMD FSR)";
+			this.Status = "Waiting for the upscaler (needs the game's resolution scaling on AMD FSR, or NVIDIA DLSS with the DLSS entry)";
 			return null;
 		}
 

@@ -21,6 +21,9 @@ public enum Upscaler
 	BuiltInFsr3,
 	AmdFsr,
 	IntelXess,
+
+	// The game's own NVIDIA DLSS (and DLAA), on GPUs the game reports as DLSS capable
+	NvidiaDlss,
 }
 
 public class UpscaleBuddyConfiguration: IPluginConfiguration

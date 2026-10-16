@@ -120,6 +120,10 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 	private const int SlotCount = 4;
 	private const uint JoinMs = 2000;
 
+	// Frames dropped for longer than this have left the generator's history too old to follow; shorter gaps (the GPU held up for a
+	// moment) keep it
+	private const double StaleSeconds = 2;
+
 	/// <summary>One frame in flight: its own copies of the inputs and its output, reused every <see cref="SlotCount"/> frames</summary>
 	private sealed class Slot
 	{
@@ -152,6 +156,7 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 	private ulong frameId;
 	private bool first = true;
 	private bool resetNext;
+	private long droppingSince;
 	private bool disposed;
 	private Exception? workerFailure;
 	private long dropped;
@@ -221,12 +226,20 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 		{
 			if (!this.IsFree(slot))
 			{
-				// The next frame has no previous generated state to follow
-				this.resetNext = true;
+				long now = Stopwatch.GetTimestamp();
+				if (this.droppingSince == 0)
+					this.droppingSince = now;
+				else if (Stopwatch.GetElapsedTime(this.droppingSince, now).TotalSeconds >= StaleSeconds && !this.resetNext)
+				{
+					Service.PluginLog.Warning($"Frame generation has been behind for {StaleSeconds} s, the next frame starts its history over");
+					this.resetNext = true;
+				}
+
 				Interlocked.Increment(ref this.dropped);
 				return null;
 			}
 
+			this.droppingSince = 0;
 			slot.Submitted.Reset();
 			slot.Failed = false;
 			slot.Completion = 0;

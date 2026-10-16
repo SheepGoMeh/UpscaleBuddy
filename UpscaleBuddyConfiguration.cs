@@ -49,5 +49,9 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	// Frames shown per second with frame generation, 0 = the display's refresh rate
 	public int FrameGenerationTarget;
 
+	// Skips the game's read of the clipboard text on a change, which is unused and can stall the game for 2 s when a tool is writing
+	// to the clipboard (see ClipboardGuard)
+	public bool SkipClipboardRead = true;
+
 	public void Save() => Service.PluginInterface.SavePluginConfig(this);
 }

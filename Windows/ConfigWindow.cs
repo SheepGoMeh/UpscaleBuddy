@@ -9,7 +9,7 @@ using UpscaleBuddy.Game;
 namespace UpscaleBuddy.Windows;
 
 public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlssPath, FramePacer framePacer, UiLayer uiLayer,
-	FrameGenerationRunner frameGeneration)
+	FrameGenerationRunner frameGeneration, ClipboardGuard clipboardGuard)
 	: Window("UpscaleBuddy", ImGuiWindowFlags.AlwaysAutoResize)
 {
 	// Saved as the enum value, the list order is independent
@@ -96,6 +96,18 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		}
 
 		ImGui.Separator();
+		ImGui.BeginDisabled(!clipboardGuard.Available);
+		if (ImGui.Checkbox("Skip the game's clipboard read", ref configuration.SkipClipboardRead))
+			configuration.Save();
+		if (ImGui.IsItemHovered())
+		{
+			ImGui.SetTooltip(
+				"The game reads the clipboard text on its main thread whenever the clipboard changes and doesn't use it. A tool\n" +
+				"copying to the clipboard (a screenshot tool, say) can make that read wait 2 seconds, freezing the game.");
+		}
+
+		ImGui.EndDisabled();
+
 		ImGui.BeginDisabled(!framePacer.Available);
 		if (ImGui.Checkbox("Low latency frame limiter", ref configuration.LowLatencyLimiter))
 			configuration.Save();

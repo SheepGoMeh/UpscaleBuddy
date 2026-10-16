@@ -21,6 +21,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 	private readonly UiLayer uiLayer;
 	private readonly RenderFrameHook renderFrames;
 	private readonly FramePacer framePacer;
+	private readonly ClipboardGuard clipboardGuard;
 	private readonly WindowSystem windowSystem;
 	private readonly ConfigWindow configWindow;
 
@@ -36,9 +37,11 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		this.uiLayer = new UiLayer(this.configuration, this.frameGeneration);
 		this.renderFrames = new RenderFrameHook();
 		this.framePacer = new FramePacer(this.configuration, this.uiLayer, this.renderFrames);
+		this.clipboardGuard = new ClipboardGuard(this.configuration);
 
 		this.windowSystem = new WindowSystem("UpscaleBuddy");
-		this.configWindow = new ConfigWindow(this.configuration, this.dlssPath, this.framePacer, this.uiLayer, this.frameGeneration);
+		this.configWindow = new ConfigWindow(this.configuration, this.dlssPath, this.framePacer, this.uiLayer, this.frameGeneration,
+			this.clipboardGuard);
 		this.windowSystem.AddWindow(this.configWindow);
 
 		Service.PluginInterface.UiBuilder.Draw += this.windowSystem.Draw;
@@ -58,6 +61,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 			return;
 		}
 
+		this.clipboardGuard.Dispose();
 		Service.Framework.Update -= this.OnFrameworkUpdate;
 		Service.CommandManager.RemoveHandler(CommandName);
 		Service.PluginInterface.UiBuilder.Draw -= this.windowSystem.Draw;

@@ -289,7 +289,8 @@ internal sealed unsafe class PresentThread: IDisposable
 		{
 			if (this.lastShown >= 0)
 			{
-				this.Show(this.Texture(this.lastShown), this.lastShownFrame);
+				(int texture, long frame) = this.FrameToReshow();
+				this.Show(this.Texture(texture), frame);
 			}
 			else
 			{
@@ -306,6 +307,21 @@ internal sealed unsafe class PresentThread: IDisposable
 		this.overlay.Disarm();
 		this.overlayDrawn = drawing;
 		Volatile.Write(ref this.overlayFinished, drawing);
+	}
+
+	/// <summary>
+	/// What the main thread's Present shows again: the frame on screen, or the newest real frame once the rings have reused that
+	/// one's slots (the present thread fell behind, a frame's layers and textures are gone then). Showing the frame without its
+	/// record drew the scene without the UI
+	/// </summary>
+	private (int Texture, long Frame) FrameToReshow()
+	{
+		long published = Volatile.Read(ref this.published);
+		if (published - this.lastShownFrame < Ring)
+			return (this.lastShown, this.lastShownFrame);
+
+		long newest = published - 1;
+		return (((int)(newest % Ring) * 2) + 1, newest);
 	}
 
 	/// <summary>The frame on screen, or the newest published one when the thread hasn't shown anything yet</summary>
@@ -548,6 +564,11 @@ internal sealed unsafe class PresentThread: IDisposable
 
 			lock (this.presentLock)
 			{
+				// The ring moves on while the generated frame and the vblank are waited for: a frame whose slots are reused by now
+				// would show without its layers, the frame on screen stays instead
+				if (Volatile.Read(ref this.published) - entry.Frame >= Ring)
+					continue;
+
 				if (ticket != null)
 					this.FillGenerated(entry, ticket, ready);
 				this.Show(this.Texture(entry.Texture), entry.Frame);

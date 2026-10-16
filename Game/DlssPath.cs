@@ -65,7 +65,7 @@ public unsafe class DlssPath: IDisposable
 	private const uint SettingNvidiaDlss = 1;
 	private const uint NvidiaVendorId = 0x10DE;
 	private const int NgxFeatureFlagDepthInverted = 0x8;
-	private const int ResetFramesAfterTerritoryChange = 3;
+	private const int ResetFramesAfterStart = 3;
 	private const int MaxRestarts = 3;
 	private const double RestartWindowSeconds = 60;
 	private const int MaxRejections = 10;
@@ -85,6 +85,10 @@ public unsafe class DlssPath: IDisposable
 		Active,
 		Releasing,
 	}
+
+	/// <summary>What a created upscaler was built for</summary>
+	private readonly record struct UpscalerKey(nint Device, Upscaler Upscaler, uint RenderWidth, uint RenderHeight, uint OutputWidth,
+		uint OutputHeight, bool InfiniteFar);
 
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly NgxParameters parameters = new();
@@ -124,6 +128,7 @@ public unsafe class DlssPath: IDisposable
 	private IUpscaler? upscaler;
 	private Downsampler? downsampler;
 	private readonly List<IDisposable> retired = [];
+	private UpscalerKey? createdKey;
 	private readonly object upscalerLock = new();
 	private long lastEvaluate;
 	private bool loggedEvaluateError;
@@ -207,20 +212,9 @@ public unsafe class DlssPath: IDisposable
 				Service.PluginLog.Warning(e, "Zero copy unavailable, the AMD DLL path copies its inputs");
 			}
 		}
-
-		Service.ClientState.TerritoryChanged += this.OnTerritoryChanged;
 	}
 
-	/// <summary>
-	/// A new area is a cut: the upscalers' history of the previous one has to go, a bad value from the loading transition can
-	/// otherwise stay in it and keep the scene black (the UI, composited separately, stays). Framework thread
-	/// </summary>
-	private void OnTerritoryChanged(uint territory)
-	{
-		this.resetFrames = ResetFramesAfterTerritoryChange;
-	}
-
-	/// <summary>Render thread: whether this frame resets the upscaler history after a territory change</summary>
+	/// <summary>Render thread: whether this frame resets the upscaler history, after a start</summary>
 	private bool TakeResetFrame()
 	{
 		int left = this.resetFrames;
@@ -340,7 +334,7 @@ public unsafe class DlssPath: IDisposable
 		if (run)
 		{
 			this.lastEvaluate = 0;
-			this.resetFrames = ResetFramesAfterTerritoryChange;
+			this.resetFrames = ResetFramesAfterStart;
 			this.Status = "On, NVIDIA DLSS (the game's own)";
 		}
 		else
@@ -426,7 +420,7 @@ public unsafe class DlssPath: IDisposable
 		this.restarts.Enqueue(now);
 		this.RetireUpscaler();
 		this.frameReady = false;
-		this.resetFrames = ResetFramesAfterTerritoryChange;
+		this.resetFrames = ResetFramesAfterStart;
 		this.InvalidateFeature();
 		this.Status = $"Restarting ({reason})";
 		Service.PluginLog.Warning($"Restarting the upscaler ({this.restarts.Count} of {MaxRestarts}): {reason}");
@@ -739,25 +733,32 @@ public unsafe class DlssPath: IDisposable
 		uint outputHeight = (uint)this.parameters.Number("OutHeight");
 		int flags = (int)this.parameters.Number("DLSS.Feature.Create.Flags");
 
-		lock (this.upscalerLock)
-		{
-			this.upscaler?.Dispose();
-			this.upscaler = null;
-			this.downsampler?.Dispose();
-			this.downsampler = null;
-		}
-
 		ID3D11Device* device;
 		context->GetDevice(&device);
 		try
 		{
+			Upscaler selected = this.selectedUpscaler;
+			UpscalerKey key = new((nint)device, selected, renderWidth, renderHeight, outputWidth, outputHeight, this.infiniteFar);
+
+			// The game releases and creates the feature on a window resize or an alt+tab too, a running upscaler of the same
+			// kind and sizes stays as it is
+			lock (this.upscalerLock)
+			{
+				if (this.upscaler != null && this.createdKey == key)
+					return NgxParameters.Success;
+
+				this.upscaler?.Dispose();
+				this.upscaler = null;
+				this.downsampler?.Dispose();
+				this.downsampler = null;
+			}
+
 			// Supersampling: FSR at the render size, then down to the output
 			bool supersampling = renderWidth > outputWidth;
 			uint upscaleWidth = supersampling ? renderWidth : outputWidth;
 			uint upscaleHeight = supersampling ? renderHeight : outputHeight;
 			string? fallback = null;
 			IUpscaler? created = null;
-			Upscaler selected = this.selectedUpscaler;
 			if (selected != Upscaler.BuiltInFsr3)
 			{
 				try
@@ -777,6 +778,7 @@ public unsafe class DlssPath: IDisposable
 			{
 				this.upscaler = created;
 				this.downsampler = createdDownsampler;
+				this.createdKey = fallback == null ? key : null;
 			}
 
 			this.RenderWidth = renderWidth;
@@ -979,11 +981,7 @@ public unsafe class DlssPath: IDisposable
 	/// <summary>
 	/// Framework thread, the upscaler is freed on the render thread
 	/// </summary>
-	private int ReleaseDetour(nint handle)
-	{
-		this.RetireUpscaler();
-		return NgxParameters.Success;
-	}
+	private int ReleaseDetour(nint handle) => NgxParameters.Success;
 
 	/// <summary>Hands the upscaler and downsampler over to the render thread, which disposes them</summary>
 	private void RetireUpscaler()
@@ -1040,7 +1038,6 @@ public unsafe class DlssPath: IDisposable
 		this.shutdownHook?.Dispose();
 		this.renderSizeHook?.Dispose();
 		this.sharedTargets?.Dispose();
-		Service.ClientState.TerritoryChanged -= this.OnTerritoryChanged;
 
 		lock (this.upscalerLock)
 		{

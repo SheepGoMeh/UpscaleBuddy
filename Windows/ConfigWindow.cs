@@ -97,13 +97,12 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 
 		ImGui.Separator();
 		ImGui.BeginDisabled(!clipboardGuard.Available);
-		if (ImGui.Checkbox("Skip the game's clipboard read", ref configuration.SkipClipboardRead))
+		if (ImGui.Checkbox("Prevent freezes when copying (clipboard fix)", ref configuration.SkipClipboardRead))
 			configuration.Save();
 		if (ImGui.IsItemHovered())
 		{
 			ImGui.SetTooltip(
-				"The game reads the clipboard text on its main thread whenever the clipboard changes and doesn't use it. A tool\n" +
-				"copying to the clipboard (a screenshot tool, say) can make that read wait 2 seconds, freezing the game.");
+				"Stops the game from freezing for a couple of seconds when you copy something in another program.");
 		}
 
 		ImGui.EndDisabled();
@@ -144,21 +143,15 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			if (ImGui.IsItemHovered())
 			{
 				ImGui.SetTooltip(
-					"Frames shown per second. The game has to render half of it, with headroom: each frame has to be built\n" +
-					"within a rendered frame. Targets that don't divide the refresh rate need a variable refresh display.");
+					"Frames shown per second. The game has to render half of it, with headroom: its frame has to be built\n" +
+					"in half a rendered frame. Targets that don't divide the refresh rate need a variable refresh display.");
 			}
 		}
 
 		// Each real frame waits half a rendered frame behind the generated one, plus about 1 ms of generation
 		int rendered = framePacer.GenerationRate;
 		if (rendered > 0)
-		{
 			ImGui.TextDisabled($"Rendering {rendered} fps, showing {rendered * 2} fps, adds about {(500 / rendered) + 1} ms of latency");
-			ImGui.TextDisabled(framePacer.PresentsOnThread ? "Frames are presented on their own thread" : "Frames are presented on the game's thread");
-			if (configuration.ShowTimings && frameGeneration.Timings.Length > 0)
-				ImGui.TextDisabled($"Frame generation per frame: {frameGeneration.Timings}");
-		}
-
 		if (!framePacer.KeepingUp)
 		{
 			int sustained = framePacer.SustainedTarget;

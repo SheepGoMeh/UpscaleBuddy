@@ -19,7 +19,6 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 	private readonly DlssPath dlssPath;
 	private readonly FrameGenerationRunner frameGeneration;
 	private readonly UiLayer uiLayer;
-	private readonly RenderFrameHook renderFrames;
 	private readonly FramePacer framePacer;
 	private readonly ClipboardGuard clipboardGuard;
 	private readonly WindowSystem windowSystem;
@@ -35,8 +34,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		this.dlssPath = new DlssPath(this.configuration);
 		this.frameGeneration = new FrameGenerationRunner(this.configuration, this.dlssPath);
 		this.uiLayer = new UiLayer(this.configuration, this.frameGeneration);
-		this.renderFrames = new RenderFrameHook();
-		this.framePacer = new FramePacer(this.configuration, this.uiLayer, this.renderFrames);
+		this.framePacer = new FramePacer(this.configuration, this.uiLayer);
 		this.clipboardGuard = new ClipboardGuard(this.configuration);
 
 		this.windowSystem = new WindowSystem("UpscaleBuddy");
@@ -68,10 +66,6 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		Service.PluginInterface.UiBuilder.OpenConfigUi -= this.configWindow.Toggle;
 		this.windowSystem.RemoveAllWindows();
 
-		// The present thread and the back buffer texture are handed back at a Present, where the render thread is idle
-		Service.Framework.RunOnFrameworkThread(this.framePacer.Stop).Wait();
-		Thread.Sleep(200);
-
 		// Present and the tick wait run on the framework thread
 		Service.Framework.RunOnFrameworkThread(this.framePacer.Dispose).Wait();
 
@@ -85,7 +79,6 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		Service.Framework.RunOnFrameworkThread(() =>
 		{
 			this.dlssPath.Finish();
-			this.renderFrames.Dispose();
 			this.uiLayer.Dispose();
 			this.frameGeneration.Dispose();
 		}).Wait();

@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
-using System.Threading;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -43,28 +42,11 @@ public unsafe class Bridge: IDisposable
 	private const int Frames = 8; // Above the swapchain's frame latency, so Present throttles rather than the allocators
 	private const int DirectPruneFrames = 120;
 
-	// A direct queue: a separate compute queue clashes with DWM and with DXVK
-	private const D3D12_COMMAND_LIST_TYPE QueueType = D3D12_COMMAND_LIST_TYPE_DIRECT;
-
-	// A queue that stops finishing work is detected by a timer and given up on, see Fault
-	private const uint WaitTimeoutMs = 2000;
-	private const double StallMs = 1500; // Under the two seconds after which Windows resets the driver
-	private const int WatchdogPeriodMs = 250;
-	private const string FaultedMessage = "the D3D12 queue stopped responding";
-
 	private readonly ID3D11Device5* device11;
 	private readonly ID3D12Device* device12;
 	private readonly ID3D12CommandQueue* queue;
 	private readonly ID3D12Fence* fence12;
 	private readonly ID3D11Fence* fence11;
-
-	// For SubmitAsync: D3D11 signals the input fence behind a frame's copies, the D3D12 queue waits for it; the completion fence is
-	// fence12, which the queue signals. One instance is used either with Execute or with SubmitAsync
-	private readonly ID3D11Fence* inputFence11;
-	private readonly ID3D12Fence* inputFence12;
-	private ulong inputValue;
-	private readonly object consumerLock = new();
-	private readonly HANDLE consumerEvent;
 	private readonly ID3D12CommandAllocator*[] allocators = new ID3D12CommandAllocator*[Frames];
 	private readonly ID3D12GraphicsCommandList*[] lists = new ID3D12GraphicsCommandList*[Frames];
 	private readonly ulong[] frameFence = new ulong[Frames];
@@ -78,15 +60,6 @@ public unsafe class Bridge: IDisposable
 	private readonly bool[] measured = new bool[Frames];
 	private ulong fenceValue;
 	private int frame;
-
-	// Watchdog state, see Fault
-	private readonly object watchdogLock = new();
-	private readonly HANDLE waitEvent;
-	private Timer? watchdog;
-	private ulong lastCompleted;
-	private long lastProgress = Stopwatch.GetTimestamp();
-	private volatile bool faulted;
-	private bool disposed;
 
 	private ID3D11DeviceContext4* context4;
 	private ID3D11DeviceContext* context4Source;
@@ -121,7 +94,7 @@ public unsafe class Bridge: IDisposable
 			ThrowIfFailed(deviceResult);
 			this.device12 = createdDevice;
 
-			D3D12_COMMAND_QUEUE_DESC queueDesc = new() { Type = QueueType };
+			D3D12_COMMAND_QUEUE_DESC queueDesc = new() { Type = D3D12_COMMAND_LIST_TYPE_DIRECT };
 			ID3D12CommandQueue* createdQueue;
 			ThrowIfFailed(this.device12->CreateCommandQueue(&queueDesc, __uuidof<ID3D12CommandQueue>(), (void**)&createdQueue));
 			this.queue = createdQueue;
@@ -137,26 +110,13 @@ public unsafe class Bridge: IDisposable
 			ThrowIfFailed(openResult);
 			this.fence11 = openedFence;
 
-			// The other direction: created by D3D11, opened on D3D12
-			ID3D11Fence* createdInput;
-			ThrowIfFailed(this.device11->CreateFence(0, D3D11_FENCE_FLAG.D3D11_FENCE_FLAG_SHARED, __uuidof<ID3D11Fence>(), (void**)&createdInput));
-			this.inputFence11 = createdInput;
-			HANDLE inputHandle;
-			ThrowIfFailed(this.inputFence11->CreateSharedHandle(null, GENERIC_ALL, null, &inputHandle));
-			ID3D12Fence* openedInput;
-			HRESULT inputResult = this.device12->OpenSharedHandle(inputHandle, __uuidof<ID3D12Fence>(), (void**)&openedInput);
-			CloseHandle(inputHandle);
-			ThrowIfFailed(inputResult);
-			this.inputFence12 = openedInput;
-			this.consumerEvent = CreateEventW(null, false, false, null);
-
 			for (int i = 0; i < Frames; i++)
 			{
 				ID3D12CommandAllocator* allocator;
-				ThrowIfFailed(this.device12->CreateCommandAllocator(QueueType, __uuidof<ID3D12CommandAllocator>(), (void**)&allocator));
+				ThrowIfFailed(this.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof<ID3D12CommandAllocator>(), (void**)&allocator));
 				this.allocators[i] = allocator;
 				ID3D12GraphicsCommandList* list;
-				ThrowIfFailed(this.device12->CreateCommandList(0, QueueType, allocator, null,
+				ThrowIfFailed(this.device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, null,
 					__uuidof<ID3D12GraphicsCommandList>(), (void**)&list));
 				this.lists[i] = list;
 				ThrowIfFailed(list->Close());
@@ -181,12 +141,6 @@ public unsafe class Bridge: IDisposable
 			this.timestampFrequency = frequency;
 
 			this.depthShader = Dx.CreateComputeShader(device, "Shaders.depth_copy.cso");
-
-			this.waitEvent = CreateEventW(null, false, false, null);
-			if (this.waitEvent == HANDLE.NULL)
-				throw new InvalidOperationException("can't create the wait event");
-
-			this.watchdog = new Timer(this.CheckProgress, null, WatchdogPeriodMs, WatchdogPeriodMs);
 		}
 		catch
 		{
@@ -209,10 +163,13 @@ public unsafe class Bridge: IDisposable
 	/// </summary>
 	public void Execute(ID3D11DeviceContext* context, RecordDelegate record, bool measure)
 	{
-		if (this.faulted)
-			throw new InvalidOperationException(FaultedMessage);
+		if (context != this.context4Source)
+		{
+			Dx.Release(this.context4);
+			this.context4 = Dx.Query<ID3D11DeviceContext4>(context);
+			this.context4Source = context;
+		}
 
-		this.EnsureContext4(context);
 		this.executeCount++;
 		if (this.executeCount % DirectPruneFrames == 0)
 			this.PruneDirect();
@@ -220,112 +177,12 @@ public unsafe class Bridge: IDisposable
 		ThrowIfFailed(this.context4->Signal(this.fence11, ++this.fenceValue));
 		context->Flush();
 
-		ID3D12GraphicsCommandList* list = this.Record(record, measure, out int slot, out ExceptionDispatchInfo? failure);
-		ThrowIfFailed(this.queue->Wait(this.fence12, this.fenceValue));
-		if (failure == null)
-			this.queue->ExecuteCommandLists(1, (ID3D12CommandList**)&list);
-		ThrowIfFailed(this.queue->Signal(this.fence12, ++this.fenceValue));
-		this.frameFence[slot] = this.fenceValue;
-
-		// D3D11 waits on the GPU
-		ThrowIfFailed(this.context4->Wait(this.fence11, this.fenceValue));
-		failure?.Throw();
-	}
-
-	/// <summary>
-	/// D3D11 side of <see cref="SubmitAsync"/>, render thread: the work so far (a frame's inputs copied) is flushed and a value
-	/// signalled behind it, which the D3D12 queue waits for; D3D11 itself waits for nothing
-	/// </summary>
-	public ulong SignalInput(ID3D11DeviceContext* context)
-	{
-		this.EnsureContext4(context);
-		ulong value = ++this.inputValue;
-		ThrowIfFailed(this.context4->Signal(this.inputFence11, value));
-		context->Flush();
-		return value;
-	}
-
-	/// <summary>
-	/// One worker thread: records and submits D3D12 work that waits for the input value, then signals the completion fence. Returns
-	/// the completion value; a failing record still completes it and the exception is rethrown after, so no one waits for ever
-	/// </summary>
-	public ulong SubmitAsync(ulong input, RecordDelegate record, bool measure)
-	{
-		if (this.faulted)
-			throw new InvalidOperationException(FaultedMessage);
-
-		ID3D12GraphicsCommandList* list = this.Record(record, measure, out int slot, out ExceptionDispatchInfo? failure);
-		ThrowIfFailed(this.queue->Wait(this.inputFence12, input));
-		if (failure == null)
-			this.queue->ExecuteCommandLists(1, (ID3D12CommandList**)&list);
-		ThrowIfFailed(this.queue->Signal(this.fence12, ++this.fenceValue));
-		this.frameFence[slot] = this.fenceValue;
-		ulong completion = this.fenceValue;
-		failure?.Throw();
-		return completion;
-	}
-
-	/// <summary>Whether the completion fence has reached the value</summary>
-	public bool IsComplete(ulong value) => this.fence12->GetCompletedValue() >= value;
-
-	/// <summary>Blocks the calling thread until the completion fence reaches the value, one waiting thread at a time; false after timeoutMs</summary>
-	public bool WaitCompleted(ulong value, uint timeoutMs)
-	{
-		long deadline = Stopwatch.GetTimestamp() + (timeoutMs * Stopwatch.Frequency / 1000);
-		lock (this.consumerLock)
-		{
-			// An earlier timed out wait can leave the event set, so a wake up is checked against the fence
-			while (!this.IsComplete(value))
-			{
-				long remaining = (deadline - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency;
-				if (remaining <= 0)
-					return false;
-
-				ThrowIfFailed(this.fence12->SetEventOnCompletion(value, this.consumerEvent));
-				WaitForSingleObject(this.consumerEvent, (uint)remaining);
-			}
-		}
-
-		return true;
-	}
-
-	/// <summary>D3D11 side: later work on the context waits on the GPU for the completion value (already met when the CPU has waited for it)</summary>
-	public void WaitOnGpu(ID3D11DeviceContext* context, ulong value)
-	{
-		this.EnsureContext4(context);
-		ThrowIfFailed(this.context4->Wait(this.fence11, value));
-	}
-
-	private void EnsureContext4(ID3D11DeviceContext* context)
-	{
-		lock (this.consumerLock)
-		{
-			if (context == this.context4Source)
-				return;
-
-			Dx.Release(this.context4);
-			this.context4 = Dx.Query<ID3D11DeviceContext4>(context);
-			this.context4Source = context;
-		}
-	}
-
-	/// <summary>
-	/// The next list, reset once the frame that last used its allocator is done, and recorded by record; the exception of a failing
-	/// record is handed back, the list closed
-	/// </summary>
-	private ID3D12GraphicsCommandList* Record(RecordDelegate record, bool measure, out int slot, out ExceptionDispatchInfo? failure)
-	{
 		// The allocator is free once the frame that last used it is done
-		slot = this.frame;
+		int slot = this.frame;
 		this.frame = (this.frame + 1) % Frames;
 		ID3D12GraphicsCommandList* list = this.lists[slot];
 		long waitStart = Stopwatch.GetTimestamp();
-		if (!this.CpuWait(this.frameFence[slot]))
-		{
-			this.Fault($"allocator {slot} still busy after {WaitTimeoutMs} ms");
-			throw new InvalidOperationException(FaultedMessage);
-		}
-
+		this.CpuWait(this.frameFence[slot]);
 		if (measure)
 			this.CpuStallMs = (this.CpuStallMs * 0.9) + (Stopwatch.GetElapsedTime(waitStart).TotalMilliseconds * 0.1);
 		if (this.measured[slot])
@@ -340,7 +197,7 @@ public unsafe class Bridge: IDisposable
 		if (measure)
 			list->EndQuery(this.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, (uint)slot * 2);
 
-		failure = null;
+		ExceptionDispatchInfo? failure = null;
 		try
 		{
 			record(list);
@@ -360,55 +217,22 @@ public unsafe class Bridge: IDisposable
 			ThrowIfFailed(list->Close());
 		}
 
-		return list;
+		ThrowIfFailed(this.queue->Wait(this.fence12, this.fenceValue));
+		if (failure == null)
+			this.queue->ExecuteCommandLists(1, (ID3D12CommandList**)&list);
+		ThrowIfFailed(this.queue->Signal(this.fence12, ++this.fenceValue));
+		this.frameFence[slot] = this.fenceValue;
+
+		// D3D11 waits on the GPU
+		ThrowIfFailed(this.context4->Wait(this.fence11, this.fenceValue));
+		failure?.Throw();
 	}
 
-	/// <summary>Blocks until the D3D12 fence reaches the value; false when it takes longer than WaitTimeoutMs</summary>
-	private bool CpuWait(ulong value)
+	/// <summary>Blocks until the D3D12 fence reaches the value</summary>
+	private void CpuWait(ulong value)
 	{
-		if (this.fence12->GetCompletedValue() >= value)
-			return true;
-
-		ThrowIfFailed(this.fence12->SetEventOnCompletion(value, this.waitEvent));
-		return WaitForSingleObject(this.waitEvent, WaitTimeoutMs) == 0;
-	}
-
-	/// <summary>
-	/// The D3D12 queue isn't finishing its work. D3D11's queue waits on it on the GPU, so a wait that never ends hangs the game's
-	/// whole GPU context and Windows resets the driver after about two seconds (which takes the desktop compositor with it).
-	/// Signalling the fence from the CPU releases D3D11; the bridge then refuses further work
-	/// </summary>
-	private void Fault(string reason)
-	{
-		if (this.faulted)
-			return;
-
-		this.faulted = true;
-		Service.PluginLog.Error($"{FaultedMessage} ({reason}), releasing D3D11 and giving up on it");
-		this.fence12->Signal(Volatile.Read(ref this.fenceValue));
-	}
-
-	/// <summary>Timer thread: submitted work whose fence hasn't moved for StallMs</summary>
-	private void CheckProgress(object? state)
-	{
-		lock (this.watchdogLock)
-		{
-			if (this.faulted || this.disposed)
-				return;
-
-			ulong submitted = Volatile.Read(ref this.fenceValue);
-			ulong completed = this.fence12->GetCompletedValue();
-			long now = Stopwatch.GetTimestamp();
-			if (completed != this.lastCompleted || completed >= submitted)
-			{
-				this.lastCompleted = completed;
-				this.lastProgress = now;
-				return;
-			}
-
-			if (Stopwatch.GetElapsedTime(this.lastProgress, now).TotalMilliseconds >= StallMs)
-				this.Fault($"fence at {completed} of {submitted} for {StallMs} ms");
-		}
+		if (this.fence12->GetCompletedValue() < value)
+			ThrowIfFailed(this.fence12->SetEventOnCompletion(value, HANDLE.NULL));
 	}
 
 	/// <summary>The game's texture opened on D3D12, null when the game didn't create it shared</summary>
@@ -535,25 +359,18 @@ public unsafe class Bridge: IDisposable
 		context->CSSetShader(null, null, 0);
 	}
 
-	/// <summary>
-	/// Waits for the queue, for at most WaitTimeoutMs; callers dispose their library contexts and twins first or after, the queue
-	/// is idle. A queue that doesn't answer is given up on rather than waited for
-	/// </summary>
+	/// <summary>Waits for the queue; callers dispose their library contexts and twins first or after, the queue is idle</summary>
 	public void WaitIdle()
 	{
-		if (this.faulted || this.queue == null || this.fence12 == null)
-			return;
-
-		this.queue->Signal(this.fence12, ++this.fenceValue);
-		if (!this.CpuWait(this.fenceValue))
-			this.Fault($"queue not idle after {WaitTimeoutMs} ms");
+		if (this.queue != null && this.fence12 != null)
+		{
+			this.queue->Signal(this.fence12, ++this.fenceValue);
+			this.CpuWait(this.fenceValue);
+		}
 	}
 
 	public void Dispose()
 	{
-		lock (this.watchdogLock)
-			this.disposed = true;
-		this.watchdog?.Dispose();
 		this.WaitIdle();
 		foreach (nint texture in new List<nint>(this.direct.Keys))
 			this.ReleaseDirect(texture);
@@ -568,17 +385,11 @@ public unsafe class Bridge: IDisposable
 		Dx.Release(this.depthSourceView);
 		Dx.Release(this.depthShader);
 		Dx.Release(this.context4);
-		Dx.Release(this.inputFence11);
-		Dx.Release(this.inputFence12);
 		Dx.Release(this.fence11);
 		Dx.Release(this.fence12);
 		Dx.Release(this.queue);
 		Dx.Release(this.device12);
 		Dx.Release(this.device11);
-		if (this.waitEvent != HANDLE.NULL)
-			CloseHandle(this.waitEvent);
-		if (this.consumerEvent != HANDLE.NULL)
-			CloseHandle(this.consumerEvent);
 		GC.SuppressFinalize(this);
 	}
 }

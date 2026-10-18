@@ -90,6 +90,9 @@ public unsafe class Bridge: IDisposable
 			ThrowIfFailed(adapterResult);
 			ID3D12Device* createdDevice;
 			HRESULT deviceResult = D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0, __uuidof<ID3D12Device>(), (void**)&createdDevice);
+			if (deviceResult.FAILED && WineVkd3d.IsWine)
+				deviceResult = WineVkd3d.CreateDevice((IUnknown*)adapter, &createdDevice);
+
 			adapter->Release();
 			ThrowIfFailed(deviceResult);
 			this.device12 = createdDevice;

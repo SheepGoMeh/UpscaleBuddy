@@ -142,7 +142,31 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 				MaxRenderSize = new Dimensions { Width = maxRenderWidth, Height = maxRenderHeight },
 				BackBufferFormat = Format(DXGI_FORMAT_B8G8R8A8_UNORM),
 			};
-			this.context = CreateContext(&create.Header, "ffxCreateContext (frame generation)");
+
+			// The loader defaults to FSR 3.1 frame generation, the DLL also holds the FSR 4 one
+			OverrideVersion fsr4 = new() { Header = { Type = DescOverrideVersion } };
+			foreach ((ulong id, string name) in ProviderVersions(DescCreateFrameGeneration, this.bridge.Device12))
+			{
+				if (name.StartsWith("4.", StringComparison.Ordinal))
+					fsr4.VersionId = id;
+			}
+
+			if (fsr4.VersionId != 0)
+			{
+				backend.Header.Next = &fsr4.Header;
+				try
+				{
+					this.context = CreateContext(&create.Header, "ffxCreateContext (frame generation)");
+				}
+				catch (Exception e)
+				{
+					Service.PluginLog.Warning(e, "FSR 4 frame generation unavailable, using the default one");
+					backend.Header.Next = null;
+				}
+			}
+
+			if (this.context == 0)
+				this.context = CreateContext(&create.Header, "ffxCreateContext (frame generation)");
 
 			string? provider = ProviderName(this.context);
 			this.Name = provider != null ? $"FSR {provider} frame generation (AMD DLL, D3D12)" : "FSR frame generation (AMD DLL, D3D12)";

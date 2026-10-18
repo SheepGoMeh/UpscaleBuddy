@@ -156,9 +156,10 @@ public unsafe class Fsr3Upscaler: IUpscaler
 	private static void RequireSupport(ID3D11Device* device)
 	{
 		D3D11_FEATURE_DATA_D3D11_OPTIONS2 options = default;
-		bool additionalFormats = OperatingSystem.IsWindowsVersionAtLeast(10) &&
-		                         device->CheckFeatureSupport(D3D11_FEATURE.D3D11_FEATURE_D3D11_OPTIONS2, &options, (uint)sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS2)) >= 0 &&
+#pragma warning disable CA1416 // The query fails where the runtime doesn't know it, which Wine's reported Windows 7 would hide
+		bool additionalFormats = device->CheckFeatureSupport(D3D11_FEATURE.D3D11_FEATURE_D3D11_OPTIONS2, &options, (uint)sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS2)) >= 0 &&
 		                         options.TypedUAVLoadAdditionalFormats;
+#pragma warning restore CA1416
 		foreach (DXGI_FORMAT format in new[] { DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R16G16_FLOAT })
 		{
 			D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support = new() { InFormat = format };

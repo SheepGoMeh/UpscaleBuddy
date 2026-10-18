@@ -19,6 +19,8 @@ public static unsafe class FfxApi
 	public const string LoaderDll = "amd_fidelityfx_loader_dx12.dll";
 
 	public const ulong DescBackendDx12 = 0x2;
+	public const ulong DescQueryGetVersions = 4;
+	public const ulong DescOverrideVersion = 5;
 	public const ulong DescQueryProviderVersion = 6;
 
 	public const uint ResourceTypeTexture2D = 2;
@@ -45,6 +47,25 @@ public static unsafe class FfxApi
 		public Header Header;
 		public ulong VersionId;
 		public byte* VersionName;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	public struct QueryGetVersions
+	{
+		public Header Header;
+		public ulong CreateDescType;
+		public void* Device;
+		public ulong* OutputCount;
+		public ulong* VersionIds;
+		public byte** VersionNames;
+	}
+
+	/// <summary>Chained into a create description to pick one of the provider versions ffxQuery lists</summary>
+	[StructLayout(LayoutKind.Sequential)]
+	public struct OverrideVersion
+	{
+		public Header Header;
+		public ulong VersionId;
 	}
 
 	[StructLayout(LayoutKind.Sequential)]
@@ -113,6 +134,32 @@ public static unsafe class FfxApi
 		return query(&context, &provider.Header) == 0 && provider.VersionName != null
 			? Marshal.PtrToStringAnsi((nint)provider.VersionName)
 			: null;
+	}
+
+	/// <summary>The provider versions the effect's DLL offers for the create description type, with the ids to override with</summary>
+	public static (ulong Id, string Name)[] ProviderVersions(ulong createDescType, ID3D12Device* device)
+	{
+		ulong count = 0;
+		QueryGetVersions desc = new() { Header = { Type = DescQueryGetVersions }, CreateDescType = createDescType, Device = device, OutputCount = &count };
+		if (query(null, &desc.Header) != 0 || count == 0)
+			return [];
+
+		ulong[] ids = new ulong[count];
+		byte*[] names = new byte*[count];
+		fixed (ulong* idsPointer = ids)
+		fixed (byte** namesPointer = names)
+		{
+			desc.VersionIds = idsPointer;
+			desc.VersionNames = namesPointer;
+			if (query(null, &desc.Header) != 0)
+				return [];
+		}
+
+		(ulong, string)[] versions = new (ulong, string)[ids.Length];
+		for (int i = 0; i < versions.Length; i++)
+			versions[i] = (ids[i], Marshal.PtrToStringAnsi((nint)names[i]) ?? "?");
+
+		return versions;
 	}
 
 	/// <summary>FFX transitions from and back to the given state itself</summary>

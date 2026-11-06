@@ -36,7 +36,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		this.dlssPath = new DlssPath(this.configuration, this.effectMask);
 		this.frameGeneration = new FrameGenerationRunner(this.configuration, this.dlssPath);
 		this.uiLayer = new UiLayer(this.configuration, this.frameGeneration);
-		this.framePacer = new FramePacer(this.configuration, this.uiLayer);
+		this.framePacer = new FramePacer(this.configuration, this.uiLayer, this.frameGeneration);
 		this.clipboardGuard = new ClipboardGuard(this.configuration);
 
 		this.windowSystem = new WindowSystem("UpscaleBuddy");

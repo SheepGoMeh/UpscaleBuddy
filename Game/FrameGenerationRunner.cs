@@ -1,4 +1,7 @@
 using System;
+using System.Threading;
+
+using FFXIVClientStructs.FFXIV.Client.UI;
 
 using TerraFX.Interop.DirectX;
 
@@ -18,10 +21,28 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	private IFrameGenerator? generator;
 	private uint width, height, maxRenderWidth, maxRenderHeight;
 	private bool failed;
+	private int skipped;
 
 	public string Status { get; private set; } = "Off";
 
-	public bool Enabled => configuration.FrameGeneration;
+	/// <summary>
+	/// Main thread: the game sleeps 50 ms after each Present. Framework.Tick does this when UIModule.ShouldLimitFps is true
+	/// (AFK with FPSDownAFK, or an inactive window with FPSInActive)
+	/// </summary>
+	public bool Paused
+	{
+		get
+		{
+			UIModule* uiModule = UIModule.Instance();
+			return uiModule != null && uiModule->ShouldLimitFps();
+		}
+	}
+
+	/// <summary>Main thread: frame generation is on and not paused</summary>
+	public bool Enabled => configuration.FrameGeneration && !this.Paused;
+
+	/// <summary>Main thread: this frame is not generated, so the next Generate resets the history</summary>
+	public void Skip() => Interlocked.Exchange(ref this.skipped, 1);
 
 	/// <summary>The frame between the previous scene and this one into output; false when there's nothing to generate from</summary>
 	public bool Generate(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* output)
@@ -43,6 +64,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 			return false;
 
 		inputs.Scene = (ID3D11Texture2D*)scene->D3D11Texture2D;
+		inputs.Reset |= Interlocked.Exchange(ref this.skipped, 0) != 0;
 		try
 		{
 			this.Fit(context, scene->ActualWidth, scene->ActualHeight, inputs);

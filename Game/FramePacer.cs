@@ -40,6 +40,7 @@ public unsafe class FramePacer: IDisposable
 
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly UiLayer uiLayer;
+	private readonly FrameGenerationRunner frameGeneration;
 	private readonly Hook<Framework.Delegates.Tick>? tickHook;
 	private readonly Hook<PresentDelegate>? presentHook;
 
@@ -67,10 +68,11 @@ public unsafe class FramePacer: IDisposable
 	private int lateIndex;
 	private int lateCount;
 
-	public FramePacer(UpscaleBuddyConfiguration configuration, UiLayer uiLayer)
+	public FramePacer(UpscaleBuddyConfiguration configuration, UiLayer uiLayer, FrameGenerationRunner frameGeneration)
 	{
 		this.configuration = configuration;
 		this.uiLayer = uiLayer;
+		this.frameGeneration = frameGeneration;
 		try
 		{
 			this.tickHook = Service.GameInteropProvider.HookFromAddress<Framework.Delegates.Tick>(
@@ -120,13 +122,13 @@ public unsafe class FramePacer: IDisposable
 		}
 	}
 
-	/// <summary>Frame generation's rendered rate (shown at twice that), 0 when off or the refresh rate is unknown</summary>
+	/// <summary>Frame generation's rendered rate (shown at twice that), 0 when off, paused or the refresh rate is unknown</summary>
 	public int GenerationRate
 	{
 		get
 		{
 			Device* device = Device.Instance();
-			return this.configuration.FrameGeneration && device != null ? this.GeneratedRate(device) : 0;
+			return this.frameGeneration.Enabled && device != null ? this.GeneratedRate(device) : 0;
 		}
 	}
 
@@ -146,8 +148,11 @@ public unsafe class FramePacer: IDisposable
 	private void PresentDetour(SwapChain* swapChain)
 	{
 		Device* device = Device.Instance();
-		int generated = this.configuration.FrameGeneration ? this.GeneratedRate(device) : 0;
+		int generated = this.frameGeneration.Enabled ? this.GeneratedRate(device) : 0;
 		bool generate = generated != 0;
+		if (!generate && swapChain == device->SwapChain)
+			this.uiLayer.DiscardRegenerated();
+
 		int rate = generate ? generated : this.LimitedRate(device);
 		if (swapChain != device->SwapChain || rate == 0)
 		{

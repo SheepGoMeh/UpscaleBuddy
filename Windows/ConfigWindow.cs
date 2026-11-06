@@ -171,6 +171,8 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 				: "Can't keep up: the game is too slow here for frame generation");
 		}
 
-		ImGui.TextDisabled(frameGeneration.Status);
+		ImGui.TextDisabled(frameGeneration.Paused
+			? "Paused while the game is AFK or inactive"
+			: frameGeneration.Status);
 	}
 }

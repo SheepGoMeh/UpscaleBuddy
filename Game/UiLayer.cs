@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 using Dalamud.Hooking;
 
@@ -93,6 +94,9 @@ public unsafe class UiLayer: IDisposable
 	private KernelTexture* regenerated; // Not owned: the target with ToneAdjust on, the source without
 	private volatile bool stopped;
 
+	// 1 when the regenerated textures hold the frame being presented. Set by Regenerate, cleared by the next Present
+	private int ready;
+
 	// Render thread
 	private nint drawn;
 	private bool composited;
@@ -137,16 +141,19 @@ public unsafe class UiLayer: IDisposable
 
 	/// <summary>
 	/// Main thread at Present, the render thread is idle: the regenerated frame (generated or repeated, with the UI, finished by
-	/// ToneAdjust) onto the back buffer; false when there's none
+	/// ToneAdjust) onto the back buffer; false when the presented frame has none
 	/// </summary>
 	public bool CopyRegenerated(SwapChain* swapChain)
 	{
-		if (this.regenerated == null || this.stopped)
+		if (Interlocked.Exchange(ref this.ready, 0) == 0 || this.regenerated == null || this.stopped)
 			return false;
 
 		this.Copy((ID3D11DeviceContext*)Device.Instance()->D3D11DeviceContext, swapChain->BackBuffer, this.regenerated);
 		return true;
 	}
+
+	/// <summary>Main thread, at a Present that doesn't use the regenerated frame: drops it</summary>
+	public void DiscardRegenerated() => Interlocked.Exchange(ref this.ready, 0);
 
 	private KernelTexture* Layer => (KernelTexture*)this.layer;
 
@@ -165,6 +172,7 @@ public unsafe class UiLayer: IDisposable
 
 		if (ui == null)
 		{
+			this.runner.Skip();
 			this.regenerated = null;
 			this.finalTarget = 0;
 			this.drawHook!.Original(atkServer, flag);
@@ -390,6 +398,7 @@ public unsafe class UiLayer: IDisposable
 				context->CopyResource((ID3D11Resource*)source->D3D11Texture2D, (ID3D11Resource*)scene->D3D11Texture2D);
 			if (this.composited)
 				this.Draw(context, source, ui, true);
+			Interlocked.Exchange(ref this.ready, 1);
 		}
 
 		if (this.composited)

@@ -36,11 +36,13 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	public bool ShowTimings;
 	public Upscaler Upscaler = Upscaler.BuiltInFsr3;
 
-	// Rain and VFX alpha times this is the upscalers' reactive mask (Game/EffectMask); rain's alpha is faint, about 0.1. 0 = off
+	// Rain and VFX alpha times this value gives the reactive mask of the upscalers (Game/EffectMask). Rain's alpha is
+	// faint, about 0.1. 0 = off
 	public float EffectResponsiveness = 4.0f;
 
-	// The D3D12 upscalers open SceneInput/SceneOutput/velocity directly instead of copying them; only shown in Debug builds
-	// until it's measured whether shared targets cost the game's passes more than the copies
+	// The D3D12 upscalers open SceneInput/SceneOutput/velocity directly and do not copy them. Only Debug builds show
+	// this option. It stays hidden until a measurement shows whether shared targets cost the game's passes more than
+	// the copies
 	public bool ZeroCopy = true;
 
 	// Replaces the game's 60/30 fps limiter with one that waits before input is read
@@ -55,8 +57,8 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	// Applies ReShade's effects to the scene before the UI, not to the finished frame (Game/ReShadeEffects)
 	public bool ReShadeBeforeUi;
 
-	// Skips the game's read of the clipboard text on a change, which is unused and can stall the game for 2 s when a tool is writing
-	// to the clipboard (see ClipboardGuard)
+	// When the clipboard changes, skips the game's read of the clipboard text. The game does not use that text. The
+	// read can stall the game for 2 s when a tool writes to the clipboard (see ClipboardGuard)
 	public bool SkipClipboardRead = true;
 
 	public void Save() => Service.PluginInterface.SavePluginConfig(this);

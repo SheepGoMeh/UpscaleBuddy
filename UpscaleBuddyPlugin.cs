@@ -73,7 +73,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		// Present and the tick wait run on the framework thread
 		Service.Framework.RunOnFrameworkThread(this.framePacer.Dispose).Wait();
 
-		// Give queued render commands (upscaler, UI composite) time to finish before tearing down
+		// Give queued render commands (upscaler, UI composite) time to finish before the teardown.
 		Service.Framework.RunOnFrameworkThread(() =>
 		{
 			this.dlssPath.Stop();

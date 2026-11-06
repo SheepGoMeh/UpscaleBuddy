@@ -1,4 +1,4 @@
-// Supersampled color to the output size, four bilinear taps per output pixel
+// Downsamples supersampled color to the output size, with four bilinear taps per output pixel
 
 Texture2D<float4> Source : register(t0);
 RWTexture2D<float4> Output : register(u0);

@@ -143,13 +143,14 @@ public unsafe class ReShadeEffects: IDisposable
 	}
 
 	/// <summary>
-	/// Main thread, at the game's Present. Returns true when Render applied the effects to this frame, then clears the flag
+	/// Main thread, at the game's Present. Returns true when Render applied the effects to this frame. Then clears the
+	/// flag
 	/// </summary>
 	public bool TakeRendered() => Interlocked.Exchange(ref this.rendered, 0) != 0;
 
 	/// <summary>
-	/// Main thread, before the second Present of a frame that already contains the effects. Calls render_effects without a
-	/// target. ReShade then only updates its uniforms, and the next Present skips its pass
+	/// Main thread, before the second Present of a frame that already contains the effects. Calls render_effects
+	/// without a target. ReShade then only updates its uniforms. The next Present skips its pass
 	/// </summary>
 	public void SkipNextPresent()
 	{
@@ -167,8 +168,8 @@ public unsafe class ReShadeEffects: IDisposable
 	}
 
 	/// <summary>
-	/// Returns an sRGB view when the target's format is typeless, or null otherwise. With null, Render uses the target's own
-	/// view for both
+	/// Returns an sRGB view when the target's format is typeless, or null otherwise. With null, Render uses the
+	/// target's own view for both
 	/// </summary>
 	private ID3D11RenderTargetView* SrgbView(ID3D11Texture2D* texture)
 	{
@@ -256,8 +257,8 @@ public unsafe class ReShadeEffects: IDisposable
 	}
 
 	/// <summary>
-	/// Framework thread, after the render thread stops calling Render. Unregisters before it removes the hooks, because ReShade
-	/// finds the add-on through them
+	/// Framework thread, after the render thread stops calling Render. Unregisters before it removes the hooks, because
+	/// ReShade finds the add-on through them
 	/// </summary>
 	public void Dispose()
 	{

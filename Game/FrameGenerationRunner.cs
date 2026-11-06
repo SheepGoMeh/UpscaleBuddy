@@ -13,8 +13,9 @@ using KernelTexture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Render thread: the generator for the current sizes, fed with the upscaler's inputs of the same frame. A failing generator
-/// is dropped and not retried until frame generation is turned off and on again
+/// Render thread. Runs the generator for the current sizes with the upscaler's inputs of the same frame. When a
+/// generator fails, the runner drops it. The runner does not try again until the user disables and enables frame
+/// generation again
 /// </summary>
 public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuration, DlssPath dlssPath): IDisposable
 {
@@ -26,8 +27,8 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	public string Status { get; private set; } = "Off";
 
 	/// <summary>
-	/// Main thread: the game sleeps 50 ms after each Present. Framework.Tick does this when UIModule.ShouldLimitFps is true
-	/// (AFK with FPSDownAFK, or an inactive window with FPSInActive)
+	/// Main thread. True when the game sleeps 50 ms after each Present. Framework.Tick does this when
+	/// UIModule.ShouldLimitFps is true (AFK with FPSDownAFK, or an inactive window with FPSInActive)
 	/// </summary>
 	public bool Paused
 	{
@@ -38,13 +39,16 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 		}
 	}
 
-	/// <summary>Main thread: frame generation is on and not paused</summary>
+	/// <summary>Main thread. True when frame generation is on and not paused</summary>
 	public bool Enabled => configuration.FrameGeneration && !this.Paused;
 
-	/// <summary>Main thread: this frame is not generated, so the next Generate resets the history</summary>
+	/// <summary>Main thread. Marks this frame as not generated, so the next Generate resets the history</summary>
 	public void Skip() => Interlocked.Exchange(ref this.skipped, 1);
 
-	/// <summary>The frame between the previous scene and this one into output; false when there's nothing to generate from</summary>
+	/// <summary>
+	/// Generates the frame between the previous scene and this one into output. Returns false when there is nothing to
+	/// generate from
+	/// </summary>
 	public bool Generate(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* output)
 	{
 		if (!configuration.FrameGeneration)

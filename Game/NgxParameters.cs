@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// NVSDK_NGX_Parameter replacement backed by a name/value store
+/// Replaces NVSDK_NGX_Parameter with a name/value store.
 /// </summary>
 public unsafe class NgxParameters: IDisposable
 {
@@ -38,8 +38,8 @@ public unsafe class NgxParameters: IDisposable
 
 	public NgxParameters()
 	{
-		// The game only reaches it through the DLSS object (+0x158, read at each use, never copied), which DlssPath restores
-		// before disposing this
+		// The game reaches it only through the DLSS object (+0x158). The game reads that field at each use and never
+		// copies it. DlssPath restores the DLSS object before it disposes this.
 		this.Address = Marshal.AllocHGlobal(8 + (SlotCount * 8));
 		this.vtable = (nint*)(this.Address + 8);
 		*(nint*)this.Address = (nint)this.vtable;
@@ -90,7 +90,7 @@ public unsafe class NgxParameters: IDisposable
 			this.pointers[name] = value;
 	}
 
-	/// <summary>Function pointer for a callback, kept alive by this object</summary>
+	/// <summary>Returns a function pointer for a callback. This object keeps the callback alive.</summary>
 	public nint Callback<T>(T callback) where T : Delegate
 	{
 		this.keepAlive.Add(callback);

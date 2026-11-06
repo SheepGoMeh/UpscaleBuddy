@@ -10,7 +10,8 @@ using static TerraFX.Interop.DirectX.DXGI_FORMAT;
 namespace UpscaleBuddy.Fsr3;
 
 /// <summary>
-/// Supersampled color to the output size, with an intermediate texture for FSR at the supersampled size
+/// Downsamples supersampled color to the output size.
+/// It has an intermediate texture for FSR at the supersampled size.
 /// </summary>
 public unsafe class Downsampler: IDisposable
 {
@@ -28,7 +29,7 @@ public unsafe class Downsampler: IDisposable
 	private readonly ID3D11Buffer* constantBuffer;
 	private readonly ID3D11SamplerState* sampler;
 
-	// Views by texture, they keep the textures alive so an address can't be reused
+	// Views by texture. They keep the textures alive, so a new texture can't reuse an address.
 	private readonly Dictionary<nint, nint> srvs = [];
 	private readonly Dictionary<nint, nint> uavs = [];
 
@@ -44,7 +45,7 @@ public unsafe class Downsampler: IDisposable
 	/// <summary>FSR output at the supersampled size</summary>
 	public ID3D11Texture2D* Intermediate { get; }
 
-	/// <summary>Render thread, output size is the used region, the texture can be allocated larger</summary>
+	/// <summary>Render thread. The output size is the used region. The output texture can be larger.</summary>
 	public void Dispatch(ID3D11DeviceContext* context, ID3D11Texture2D* color, uint renderWidth, uint renderHeight, ID3D11Texture2D* output,
 		uint outputWidth, uint outputHeight)
 	{

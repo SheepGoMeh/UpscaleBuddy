@@ -11,8 +11,8 @@ using static TerraFX.Interop.DirectX.DXGI_FORMAT;
 namespace UpscaleBuddy.Ffx;
 
 /// <summary>
-/// The FFX API (FidelityFX SDK 2.x) through AMD's signed loader: shared structs and the loader's exports. Each effect's
-/// DLL is loaded by full path first, the loader then finds it by name
+/// The FFX API (FidelityFX SDK 2.x) through AMD's signed loader. It holds the shared structs and the loader's exports.
+/// Load loads each effect's DLL by full path first. The loader then finds the DLL by name.
 /// </summary>
 public static unsafe class FfxApi
 {
@@ -57,7 +57,7 @@ public static unsafe class FfxApi
 
 	private delegate void MessageDelegate(uint type, char* message);
 
-	// Kept alive here, the DLLs call it from any context
+	// This field keeps the delegate alive. The DLLs call it from any context.
 	private static readonly MessageDelegate MessageCallback = OnMessage;
 
 	private static nint loader;
@@ -69,7 +69,7 @@ public static unsafe class FfxApi
 
 	public static nint Message => Marshal.GetFunctionPointerForDelegate(MessageCallback);
 
-	/// <summary>The effect's DLL by full path, then the loader once</summary>
+	/// <summary>Loads the effect's DLL by full path, then loads the loader once.</summary>
 	public static void Load(string effectDll)
 	{
 		string directory = Service.PluginInterface.AssemblyLocation.DirectoryName!;
@@ -106,7 +106,10 @@ public static unsafe class FfxApi
 		context = 0;
 	}
 
-	/// <summary>"FSR 4.1.1" style name of the provider the loader picked for the context, null when it doesn't say</summary>
+	/// <summary>
+	/// "FSR 4.1.1" style name of the provider that the loader picked for the context.
+	/// Null when the query does not return a name.
+	/// </summary>
 	public static string? ProviderName(nint context)
 	{
 		ProviderVersion provider = new() { Header = { Type = DescQueryProviderVersion } };

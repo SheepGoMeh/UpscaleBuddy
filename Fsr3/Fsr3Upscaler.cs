@@ -12,8 +12,8 @@ using static TerraFX.Interop.DirectX.DXGI_FORMAT;
 namespace UpscaleBuddy.Fsr3;
 
 /// <summary>
-/// FSR 3.1 upscaler on D3D11, port of ffx_fsr3upscaler.cpp from the FidelityFX SDK (MIT)
-/// Shaders built by Shaders/Build-Shaders.ps1 for LDR color, inverted depth and low resolution motion vectors
+/// FSR 3.1 upscaler on D3D11, a port of ffx_fsr3upscaler.cpp from the FidelityFX SDK (MIT).
+/// Shaders/Build-Shaders.ps1 builds the shaders for LDR color, inverted depth and low resolution motion vectors.
 /// </summary>
 public unsafe class Fsr3Upscaler: IUpscaler
 {
@@ -117,7 +117,7 @@ public unsafe class Fsr3Upscaler: IUpscaler
 	private readonly List<nint> owned = [];
 	private readonly Dictionary<string, Pass> passes = [];
 
-	// Views on the game's textures by texture, they keep the textures alive so an address can't be reused
+	// Views on the game's textures by texture. They keep the textures alive, so a new texture can't reuse an address.
 	private readonly Dictionary<nint, nint> inputSrvs = [];
 	private readonly Dictionary<nint, nint> inputUavs = [];
 
@@ -153,8 +153,9 @@ public unsafe class Fsr3Upscaler: IUpscaler
 	private float preExposure;
 
 	/// <summary>
-	/// The luma pyramid reads its frame info (R32G32B32A32_FLOAT) and SPD mip 5 (R16G16_FLOAT) back through UAVs: typed UAV
-	/// loads beyond the R32 formats, optional below feature level 12. Without them the shader can't be created
+	/// The luma pyramid reads its frame info (R32G32B32A32_FLOAT) and SPD mip 5 (R16G16_FLOAT) back through UAVs.
+	/// These are typed UAV loads beyond the R32 formats, which are optional below feature level 12.
+	/// Without them, the device can't create the shader.
 	/// </summary>
 	private static void RequireSupport(ID3D11Device* device)
 	{
@@ -213,7 +214,7 @@ public unsafe class Fsr3Upscaler: IUpscaler
 			this.dilatedMotionVectors = this.Create(rw, rh, DXGI_FORMAT_R16G16_FLOAT);
 			this.reconstructedPreviousDepth = this.Create(rw, rh, DXGI_FORMAT_R32_UINT);
 
-			// Full mip chain, passes write mips 0-5
+			// Full mip chain. The passes write mips 0-5.
 			uint spdWidth = Math.Max(1, rw / 2), spdHeight = Math.Max(1, rh / 2);
 			uint spdMipCount = (uint)Math.Floor(Math.Log2(Math.Max(spdWidth, spdHeight))) + 1;
 			ID3D11Texture2D* spdTexture = this.Own(Dx.CreateTexture(device, spdWidth, spdHeight, DXGI_FORMAT_R16G16_FLOAT, spdMipCount,
@@ -267,7 +268,7 @@ public unsafe class Fsr3Upscaler: IUpscaler
 	public uint UpscaleHeight => this.upscaleHeight;
 
 	/// <summary>
-	/// Render thread, follows fsr3upscalerDispatch
+	/// Render thread. Follows fsr3upscalerDispatch.
 	/// </summary>
 	public void Dispatch(ID3D11DeviceContext* context, in DispatchParams p)
 	{

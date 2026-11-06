@@ -9,7 +9,8 @@ using static TerraFX.Interop.DirectX.DXGI_FORMAT;
 namespace UpscaleBuddy.D3D12;
 
 /// <summary>
-/// Runs a D3D12 upscaler library over the bridge: game textures shared with D3D12 are read directly, others copied into twins
+/// Runs a D3D12 upscaler library over the bridge.
+/// The library reads game textures shared with D3D12 directly. The upscaler copies other textures into twins.
 /// </summary>
 public unsafe class D3D12Upscaler: IUpscaler
 {
@@ -54,7 +55,10 @@ public unsafe class D3D12Upscaler: IUpscaler
 
 	public uint UpscaleHeight { get; }
 
-	/// <summary>Handoff = D3D11 waiting on D3D12 minus the backend: fence latency, queue switches, late D3D12 submission</summary>
+	/// <summary>
+	/// Handoff = D3D11 waiting on D3D12 minus the backend.
+	/// It includes fence latency, queue switches and late D3D12 submission.
+	/// </summary>
 	public string Timings
 	{
 		get
@@ -85,10 +89,10 @@ public unsafe class D3D12Upscaler: IUpscaler
 		Twin outputTwin = directOutput ?? (this.output ??= this.bridge.CreateTwin(Dx.GetDesc(p.Output).Format, this.UpscaleWidth, this.UpscaleHeight));
 		Twin depthTwin = this.depth ??= this.bridge.CreateTwin(DXGI_FORMAT_R32_FLOAT, this.MaxRenderWidth, this.MaxRenderHeight);
 
-		// Created shared by Game/EffectMask, never copied
+		// Game/EffectMask creates it shared, so it is never copied
 		Input reactive = p.Reactive != null && this.bridge.Direct(p.Reactive) is { } reactiveTwin ? reactiveTwin.Input : default;
 
-		// D3D11: game textures into the twins unless D3D12 reads them directly
+		// D3D11 copies the game textures into the twins, unless D3D12 reads them directly
 		if (directColor == null)
 			Bridge.Copy(context, colorTwin.Texture11, p.Color, colorTwin.Input);
 		if (directMotionVectors == null)
@@ -106,7 +110,7 @@ public unsafe class D3D12Upscaler: IUpscaler
 				upscaleWidth, upscaleHeight),
 			p.Measure);
 
-		// The output twin back into the game's output
+		// D3D11 copies the output twin back into the game's output
 		if (p.Measure)
 			this.timer.Mark(context, 2);
 		if (directOutput == null)
@@ -120,7 +124,7 @@ public unsafe class D3D12Upscaler: IUpscaler
 
 	public void Dispose()
 	{
-		// The D3D12 queue can still be running the last frames, the backend's context too
+		// The D3D12 queue can still run the last frames, and the backend's context with them
 		this.bridge.WaitIdle();
 		this.backend?.Dispose();
 		Bridge.Release(this.color);

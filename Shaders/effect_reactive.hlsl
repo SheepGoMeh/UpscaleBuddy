@@ -1,4 +1,5 @@
-// Rain and VFX coverage (alpha of the game's depth of field effect mask, Game/EffectMask.cs) to the upscalers' reactive mask
+// Converts rain and VFX coverage to the upscalers' reactive mask.
+// The coverage is the alpha of the game's depth of field effect mask (Game/EffectMask.cs).
 
 Texture2D<float4> Mask : register(t0);
 RWTexture2D<float> Reactive : register(u0);

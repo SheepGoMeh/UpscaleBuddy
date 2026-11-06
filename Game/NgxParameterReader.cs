@@ -4,8 +4,8 @@ using System.Text;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Reads values out of the game's real NVSDK_NGX_Parameter (the one NGX made, not <see cref="NgxParameters"/>) through its vtable,
-/// and sets resources on it
+/// Reads values from the game's real NVSDK_NGX_Parameter through its vtable, and sets resources on it.
+/// This is the object that NGX made, not <see cref="NgxParameters"/>.
 /// </summary>
 internal static unsafe class NgxParameterReader
 {
@@ -22,7 +22,7 @@ internal static unsafe class NgxParameterReader
 
 	private static readonly Dictionary<string, byte[]> Keys = [];
 
-	/// <summary>The value under name, whichever numeric type NGX stored it as</summary>
+	/// <summary>Gets the value under name, for any numeric type that NGX stored it as.</summary>
 	public static bool TryNumber(nint parameters, string name, out double value)
 	{
 		nint* table = *(nint**)parameters;
@@ -63,7 +63,7 @@ internal static unsafe class NgxParameterReader
 
 	public static double Number(nint parameters, string name) => TryNumber(parameters, name, out double value) ? value : 0;
 
-	/// <summary>A resource or pointer set under name, 0 when there is none</summary>
+	/// <summary>Gets the resource or pointer under name. Returns 0 when there is none.</summary>
 	public static nint Pointer(nint parameters, string name)
 	{
 		nint* table = *(nint**)parameters;
@@ -78,7 +78,7 @@ internal static unsafe class NgxParameterReader
 		}
 	}
 
-	/// <summary>A D3D11 resource under name, null clears it</summary>
+	/// <summary>Sets a D3D11 resource under name. A null resource clears it.</summary>
 	public static void Resource(nint parameters, string name, void* resource)
 	{
 		nint* table = *(nint**)parameters;

@@ -17,10 +17,11 @@ using Framework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Replaces the game's frame limiter. The game sleeps inside SwapChain.Present after the frame is built, so what
-/// reaches the screen is a whole sleep old. Here the sleep runs after Framework.Tick, before the next message pump and
-/// input read, sized so the frame is done just in time for an absolute Present schedule.
-/// Frame generation: base rate refresh/2, the generated frame presented first and the real one half a frame later.
+/// Replaces the game's frame limiter. The game sleeps inside SwapChain.Present after it builds the frame. Thus the
+/// frame that reaches the screen is a whole sleep old. This class sleeps after Framework.Tick, before the next message
+/// pump and input read. The sleep length makes the frame complete just in time for an absolute Present schedule.
+/// Frame generation: the base rate is refresh/2. The class presents the generated frame first and the real frame half
+/// a frame later.
 /// </summary>
 public unsafe class FramePacer: IDisposable
 {
@@ -45,11 +46,12 @@ public unsafe class FramePacer: IDisposable
 	private readonly Hook<Framework.Delegates.Tick>? tickHook;
 	private readonly Hook<PresentDelegate>? presentHook;
 
-	// Main thread, tick start to Present of the last frames
+	// Main thread. The time from tick start to Present for each of the last frames
 	private readonly long[] work = new long[32];
 	private int workIndex;
 
-	// Frame generation: the longer half of each of the last frames, first Present or this frame's work + second Present
+	// Frame generation: the longer half of each of the last frames. A half is the first Present, or this frame's work +
+	// the second Present.
 	private readonly long[] halves = new long[32];
 	private int halfIndex;
 	private long tickStart;
@@ -57,10 +59,10 @@ public unsafe class FramePacer: IDisposable
 	private bool presented;
 	private readonly HANDLE timer = CreateWaitableTimerExW(null, null, HighResolutionTimer, TimerAllAccess);
 
-	// Back buffer content for the second Present, the discard swap effect leaves it undefined
+	// Back buffer content for the second Present. The discard swap effect leaves the back buffer undefined.
 	private ID3D11Texture2D* held;
 
-	// DWM's vblank grid, read when the schedule is aligned
+	// DWM's vblank grid. The pacer reads it when it aligns the schedule.
 	private long vblank;
 	private long vblankPeriod;
 
@@ -95,16 +97,18 @@ public unsafe class FramePacer: IDisposable
 	public bool Available { get; }
 
 	/// <summary>
-	/// Frame generation keeps up with the target: false once over 5% of the last 120 frames lost their generated frame
-	/// (first Present later than its vblank lead, so it flips together with the second), true again under 1%, so it
-	/// doesn't flicker
+	/// True when frame generation keeps up with the target. It changes to false when over 5% of the last 120 frames
+	/// lost their generated frame. A frame loses it when its first Present is later than its vblank lead. Then the
+	/// first Present flips together with the second. It changes to true again under 1%. The two limits stop flicker.
 	/// </summary>
 	public bool KeepingUp { get; private set; } = true;
 
 	/// <summary>
-	/// The target the recent frames would hold. Half a rendered frame each: the first Present, then the next frame's work
-	/// and the second Present; shown at 1 / the longer of the two at most, from the slowest of the last frames. Includes
-	/// what others spend inside Present (overlays, capture tools)
+	/// The target that the recent frames would hold. Each rendered frame has two halves:
+	/// - The first Present.
+	/// - The next frame's work and the second Present.
+	/// The shown rate is at most 1 / the longer half, from the slowest of the last frames. The value includes the time
+	/// that other software spends inside Present (overlays, capture tools).
 	/// </summary>
 	public int SustainedTarget
 	{
@@ -125,7 +129,10 @@ public unsafe class FramePacer: IDisposable
 		}
 	}
 
-	/// <summary>Frame generation's rendered rate (shown at twice that), 0 when off, paused or the refresh rate is unknown</summary>
+	/// <summary>
+	/// Frame generation's rendered rate. The display shows frames at twice this rate. The value is 0 when frame
+	/// generation is off or paused, or when the refresh rate is unknown.
+	/// </summary>
 	public int GenerationRate
 	{
 		get
@@ -180,15 +187,16 @@ public unsafe class FramePacer: IDisposable
 		else
 			this.ResetHeadroom();
 
-		// First frame, or behind by more than the second Present's slot, which would go out right after the first in the
-		// same vblank and lose the generated frame
+		// Align again on the first frame, or when the pacer is behind by more than the second Present's slot. In
+		// that case the second Present would go out right after the first in the same vblank. Then the generated
+		// frame would not show.
 		long behind = generate ? period / 2 : period;
 		if (this.deadline == 0 || now - this.deadline > behind)
 			this.deadline = this.AlignToVBlank(now);
 
 		Wait(this.deadline);
 
-		// Cap 0 skips the game's sleep, preset 1 is sync interval 1
+		// Cap 0 skips the game's sleep. Preset 1 is sync interval 1.
 		uint preset = device->FrameRateLimitPresetPresent;
 		ushort cap = device->FrameRateLimitPresent;
 		device->FrameRateLimitPresent = 0;
@@ -223,7 +231,10 @@ public unsafe class FramePacer: IDisposable
 		return this.vblankPeriod > 0;
 	}
 
-	/// <summary>The first time at or after this one that a Present issued then reaches the screen at the next vblank</summary>
+	/// <summary>
+	/// Returns the first time at or after this one when a Present issued at that time reaches the screen at the next
+	/// vblank.
+	/// </summary>
 	private long AlignToVBlank(long time)
 	{
 		if (!this.ReadVBlank())
@@ -258,7 +269,10 @@ public unsafe class FramePacer: IDisposable
 		this.KeepingUp = true;
 	}
 
-	/// <summary>Half the target (the refresh rate unless set lower), frames are shown at twice this; the game's limit doesn't apply</summary>
+	/// <summary>
+	/// Returns half the target. The target is the refresh rate unless the configuration sets it lower. The display
+	/// shows frames at twice this rate. The game's limit does not apply.
+	/// </summary>
 	private int GeneratedRate(Device* device)
 	{
 		int refresh = device->FrameRate;
@@ -266,7 +280,7 @@ public unsafe class FramePacer: IDisposable
 		return (target > 0 && target < refresh ? target : refresh) / 2;
 	}
 
-	/// <summary>Options 60/30 fps, only when below the refresh rate like the game's own limiter</summary>
+	/// <summary>Returns the 60/30 fps option only when it is below the refresh rate, like the game's limiter</summary>
 	private int LimitedRate(Device* device)
 	{
 		if (!this.configuration.LowLatencyLimiter || device->FrameRateLimitPresetPresent != 1)
@@ -277,10 +291,12 @@ public unsafe class FramePacer: IDisposable
 	}
 
 	/// <summary>
-	/// The generated frame (halfway from the previous frame to this one) first, this frame half a frame later; the frame
-	/// again when nothing was generated. Queued back to back, the blt swapchain doesn't hold the second for the next vblank
-	/// and the compositor only shows the newer one, so the second Present is timed. effects: the frame already
-	/// contains ReShade's effects. Neither Present runs ReShade's pass
+	/// Presents the generated frame (halfway from the previous frame to this one) first, and this frame half a frame
+	/// later. When the runner generates nothing, it presents this frame again. The pacer times the second Present
+	/// because of two Presents queued back to back:
+	/// - The blt swapchain does not hold the second Present for the next vblank.
+	/// - The compositor only shows the newer one.
+	/// When effects is true, the frame already contains ReShade's effects. Neither Present runs ReShade's pass.
 	/// </summary>
 	/// <returns>How long each Present call took, ours and whatever else runs inside it</returns>
 	private (long First, long Second) PresentTwice(Device* device, SwapChain* swapChain, long period, bool effects)
@@ -325,7 +341,10 @@ public unsafe class FramePacer: IDisposable
 
 	private long PredictedWork() => this.work.Max() + Margin;
 
-	/// <summary>Waits on the high resolution timer until shortly before, then spins; the timer's tick isn't the game's</summary>
+	/// <summary>
+	/// Waits on the high resolution timer until shortly before the time, then spins. The timer's tick is not the game's
+	/// tick.
+	/// </summary>
 	private void Wait(long until)
 	{
 		long now = Stopwatch.GetTimestamp();

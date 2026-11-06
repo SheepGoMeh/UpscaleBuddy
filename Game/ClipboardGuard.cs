@@ -7,10 +7,14 @@ using FFXIVClientStructs.FFXIV.Client.UI;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// The game is a clipboard viewer: on every clipboard change its window procedure calls UIClipboard.OnClipboardDataChanged, which
-/// opens the clipboard and reads its text on the main thread, and then hands it to a function that does nothing. When a tool such
-/// as ShareX copies a screenshot's path it deadlocks with the tool's OleFlushClipboard, which retries for 2 s until the clipboard is
-/// free while the game waits on the tool: the game stops for 2 s. Skipping the read ends that, the text isn't used
+/// The game is a clipboard viewer.
+/// On every clipboard change, its window procedure calls UIClipboard.OnClipboardDataChanged.
+/// That function opens the clipboard and reads its text on the main thread.
+/// Then it gives the text to a function that does nothing.
+/// When a tool such as ShareX copies a screenshot's path, the read deadlocks with the tool's OleFlushClipboard.
+/// OleFlushClipboard retries for 2 s until the clipboard is free, while the game waits on the tool.
+/// The game stops for 2 s.
+/// The detour skips the read, so the game does not stop. The game does not use the text.
 /// </summary>
 public unsafe class ClipboardGuard: IDisposable
 {

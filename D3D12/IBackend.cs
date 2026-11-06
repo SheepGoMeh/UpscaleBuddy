@@ -7,7 +7,8 @@ using UpscaleBuddy.Fsr3;
 namespace UpscaleBuddy.D3D12;
 
 /// <summary>
-/// A texture on the D3D12 device: the game's own when it's shared, otherwise our twin holding a copy
+/// A texture on the D3D12 device. It is the game's own texture when that texture is shared.
+/// Otherwise it is our twin that holds a copy.
 /// </summary>
 public readonly unsafe struct Input(ID3D12Resource* resource, DXGI_FORMAT format, uint width, uint height, bool unorderedAccess)
 {
@@ -19,7 +20,7 @@ public readonly unsafe struct Input(ID3D12Resource* resource, DXGI_FORMAT format
 }
 
 /// <summary>
-/// An upscaler library on the D3D12 device, D3D12Upscaler does everything around it
+/// An upscaler library on the D3D12 device. D3D12Upscaler does everything around it.
 /// </summary>
 public unsafe interface IBackend: IDisposable
 {
@@ -30,8 +31,10 @@ public unsafe interface IBackend: IDisposable
 	string Label { get; }
 
 	/// <summary>
-	/// Records the upscale into the open command list; every texture arrives in COMMON state and has to be left in it.
-	/// reactive (R8) has a null resource when there's none. Throws when the library fails, the list is then dropped
+	/// Records the upscale into the open command list.
+	/// Every texture arrives in COMMON state, and Record must leave it in that state.
+	/// reactive (R8) has a null resource when there is no reactive mask.
+	/// Throws when the library fails. The bridge then drops the list.
 	/// </summary>
 	void Record(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input reactive, in Input output,
 		in Fsr3Upscaler.DispatchParams p, uint upscaleWidth, uint upscaleHeight);

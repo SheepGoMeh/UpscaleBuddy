@@ -1,4 +1,4 @@
-// Draws the UI layer over the back buffer: premultiplied alpha, blended with ONE, INV_SRC_ALPHA
+// Draws the UI layer over the back buffer. The UI has premultiplied alpha, and the blend uses ONE, INV_SRC_ALPHA.
 Texture2D<float4> ui : register(t0);
 
 // Fullscreen triangle

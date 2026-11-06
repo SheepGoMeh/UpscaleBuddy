@@ -21,24 +21,28 @@ using KernelTexture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Splits each frame into the scene and the UI, the inputs frame generation needs, and finishes extra frames the way the
-/// game finishes its own. It also splits the frame without frame generation when ReShade's effects go under the UI.
+/// Splits each frame into the scene and the UI. Frame generation needs these inputs. The class also finishes extra
+/// frames the same way that the game finishes its own frames. It also splits the frame without frame generation when
+/// ReShade's effects go under the UI.
 /// - AtkServer.Draw (from RaptureAtkModule.Draw2D): binds RTM+0x570, the final target, and builds the UI's commands.
-///   Here RTM+0x570 is our layer for the call and restored after.
-/// - SetBlendState (render thread): while the layer is render target 0 the packed blend key gets alpha factors that
-///   accumulate coverage like the colour's destination term, so the layer is premultiplied alpha.
+///   For this call, RTM+0x570 points to our layer. The detour restores it after the call.
+/// - SetBlendState (render thread): while the layer is render target 0, the packed blend key gets alpha factors. These
+///   factors accumulate coverage like the colour's destination term. Thus the layer is premultiplied alpha.
 /// - Callbacks in view 31 around ToneAdjust (PostEffectManager.Submit, view 31, sort key 0xFFFFFFFF), after all UI:
-///   before it the scene is copied into a two frame ring and the layer composited onto the final target, so ToneAdjust
-///   sees scene and UI like the game made them; after it a regenerated frame (scene + layer) is built and the layer cleared.
-/// - The regenerated frame goes through the game's own ToneAdjust chain (PostEffectManager+0x1B0) again, its input and
-///   output pointed at our textures for the call.
+///   - Before ToneAdjust, a callback copies the scene into a two frame ring and composites the layer onto the final
+///     target. Thus ToneAdjust sees the scene and the UI as the game made them.
+///   - After ToneAdjust, a callback builds a regenerated frame (scene + layer) and clears the layer.
+/// - The regenerated frame goes through the game's own ToneAdjust chain (PostEffectManager+0x1B0) again. For that call,
+///   the input and output of the chain point to our textures.
 /// </summary>
 public unsafe class UiLayer: IDisposable
 {
-	// RenderTargetManager, Kernel::Texture* the UI is drawn on: the back buffer, or ToneAdjustSource (RTM+0x370) with ToneAdjust on
+	// RenderTargetManager: the Kernel::Texture* that the UI draws on. This is the back buffer, or ToneAdjustSource
+	// (RTM+0x370) when ToneAdjust is on.
 	private const int FinalTargetOffset = 0x570;
 
-	// PostEffectManager+0x1B0: ToneAdjust, input PostEffectManager+0x4028 (= ToneAdjustSource), output +0x4020 (final)
+	// PostEffectManager+0x1B0: the ToneAdjust chain. Its input is PostEffectManager+0x4028 (= ToneAdjustSource). Its
+	// output is +0x4020 (final).
 	private const int ToneAdjustChainOffset = 0x1B0;
 	private const int ChainInputOffset = 0x18; // PostEffectChain, Kernel::Texture*
 	private const int PartOutputOffset = 0x38; // PostEffectPart, render target 0
@@ -56,18 +60,22 @@ public unsafe class UiLayer: IDisposable
 	private const int ToneFlagOffset = 0x9C;
 	private const int ToneAmountOffset = 0xA0;
 
-	// RenderTargetManager.Initialize's targets: TextureRenderTarget | ReadWrite | UserManaged, allocation class 3
+	// RenderTargetManager.Initialize creates its targets with these values: TextureRenderTarget | ReadWrite |
+	// UserManaged, allocation class 3.
 	private const TextureFlags TargetFlags = TextureFlags.TextureRenderTarget | TextureFlags.ReadWrite | TextureFlags.UserManaged;
 	private const uint AllocationClass = 3;
 
-	// Callback command (ImmediateContextDX11.ExecuteCommands type 0xE): fn +0x8, arg +0x10, flags +0x18; ours carries its
-	// arguments after it, in the command buffer, alive until executed
+	// Callback command (ImmediateContextDX11.ExecuteCommands type 0xE): fn +0x8, arg +0x10, flags +0x18.
+	// Our command keeps its arguments after it in the command buffer. They stay alive until the command executes.
 	private const uint CallbackCommandType = 0xE;
 	private const int CallbackSize = 0x20;
 	private const int ToneAdjustView = 31;
 	private const uint BeforeToneAdjust = 0x0FFFFFFE;
-	private const uint AfterToneAdjust = 0x0FFFFFFF; // Same key as ToneAdjust, queued later so sorted after it
-	private const int ContextSubViewFlagOffset = 0x2F70; // Context: when 0 the top nibble of view 31 keys is forced to 0xF
+	// Same key as ToneAdjust. QueueFrame queues it later, so it sorts after ToneAdjust
+	private const uint AfterToneAdjust = 0x0FFFFFFF;
+
+	// Context: when this byte is 0, the game forces the top nibble of view 31 keys to 0xF
+	private const int ContextSubViewFlagOffset = 0x2F70;
 
 	private delegate void SetBlendStateDelegate(ImmediateContext* context, uint state);
 	private delegate void SetTargetDelegate(ImmediateContext* context, nint command);
@@ -84,28 +92,29 @@ public unsafe class UiLayer: IDisposable
 	private readonly Hook<SetBlendStateDelegate>? setBlendStateHook;
 	private readonly Hook<SetTargetDelegate>? setTargetHook;
 
-	// Main thread sets it at the UI pass: the final target, whose binds with a depth buffer are nameplates
+	// The final target. The main thread sets it at the UI pass. Binds of this target with a depth buffer are
+	// nameplates.
 	private volatile nint finalTarget;
 	private readonly delegate* unmanaged<PostEffectChain*, KernelTexture*, void> setChainInput;
 	private readonly delegate* unmanaged<PostEffectChain*, KernelTexture*, void> setChainOutput;
 	private readonly delegate* unmanaged<PostEffectChain*, void> renderChain;
 
-	// Kept alive here, the render thread calls them from the command buffer
+	// These fields keep the delegates alive. The render thread calls them from the command buffer.
 	private readonly CallbackDelegate compositeCallback;
 	private readonly CallbackDelegate regenerateCallback;
 	private readonly nint compositeFunction;
 	private readonly nint regenerateFunction;
 
-	// Main thread creates them, the render thread uses them through the callbacks' arguments
+	// The main thread creates them. The render thread uses them through the callbacks' arguments.
 	private volatile nint layer;
 	private readonly KernelTexture*[] scenes = new KernelTexture*[2];
 	private int sceneIndex;
 	private KernelTexture* regeneratedSource;
 	private KernelTexture* regeneratedTarget;
-	private KernelTexture* regenerated; // Not owned: the target with ToneAdjust on, the source without
+	private KernelTexture* regenerated; // Not owned. The target when ToneAdjust is on, the source when it is off
 	private volatile bool stopped;
 
-	// 1 when the regenerated textures hold the frame being presented. Set by Regenerate, cleared by the next Present
+	// 1 when the regenerated textures hold the frame being presented. Regenerate sets it. The next Present clears it.
 	private int ready;
 
 	// Render thread
@@ -154,9 +163,10 @@ public unsafe class UiLayer: IDisposable
 	public bool Available { get; }
 
 	/// <summary>
-	/// Main thread at Present, the render thread is idle: the regenerated frame (generated or repeated, with the UI, finished by
-	/// ToneAdjust) onto the back buffer; false when the presented frame has none
+	/// Main thread, at Present. The render thread is idle. Copies the regenerated frame onto the back buffer. The
+	/// regenerated frame is generated or repeated and has the UI. ToneAdjust finished it.
 	/// </summary>
+	/// <returns>False when the presented frame has no regenerated frame.</returns>
 	public bool CopyRegenerated(SwapChain* swapChain)
 	{
 		if (Interlocked.Exchange(ref this.ready, 0) == 0 || this.regenerated == null || this.stopped)
@@ -166,12 +176,12 @@ public unsafe class UiLayer: IDisposable
 		return true;
 	}
 
-	/// <summary>Main thread, at a Present that doesn't use the regenerated frame: drops it</summary>
+	/// <summary>Main thread, at a Present that does not use the regenerated frame. Drops that frame.</summary>
 	public void DiscardRegenerated() => Interlocked.Exchange(ref this.ready, 0);
 
 	private KernelTexture* Layer => (KernelTexture*)this.layer;
 
-	/// <summary>Main thread, the UI's commands are being built</summary>
+	/// <summary>Main thread. AtkServer.Draw builds the UI's commands.</summary>
 	private void DrawDetour(AtkServer* atkServer, bool flag)
 	{
 		KernelTexture** final = (KernelTexture**)((byte*)RenderTargetManager.Instance() + FinalTargetOffset);
@@ -208,8 +218,9 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// A B8G8R8A8 render target of this size in the slot, recreated when it changes; null when creation fails. One format for
-	/// all of ours: the back buffer's Kernel format (B8G8R8X8) can't be created, copies to and from it are blits
+	/// Returns a B8G8R8A8 render target of this size in the slot. Recreates it when the size changes. Returns null when
+	/// creation fails. All our textures use one format. CreateTexture2D cannot create the back buffer's Kernel format
+	/// (B8G8R8X8), so copies to and from the back buffer are blits.
 	/// </summary>
 	private KernelTexture* Fit(ref KernelTexture* slot, uint width, uint height)
 	{
@@ -233,8 +244,8 @@ public unsafe class UiLayer: IDisposable
 	private (uint, uint) failedSize;
 
 	/// <summary>
-	/// Main thread. Queues the frame's callbacks in view 31 around ToneAdjust. With frame generation, it also queues ToneAdjust
-	/// for the regenerated frame. effects: the composite callback applies ReShade's effects
+	/// Main thread. Queues the frame's callbacks in view 31 around ToneAdjust. With frame generation, it also queues
+	/// ToneAdjust for the regenerated frame. When effects is true, the composite callback applies ReShade's effects.
 	/// </summary>
 	private void QueueFrame(KernelTexture* target, KernelTexture* ui, bool generate, bool effects)
 	{
@@ -264,12 +275,13 @@ public unsafe class UiLayer: IDisposable
 		uint top = (*((byte*)context + ContextSubViewFlagOffset) == 0 ? sortKey | 0xF0000000 : sortKey) & 0xF0000000;
 		context->ViewIndex = ToneAdjustView;
 
-		// The composite callback does not use SetDefaultState. SetDefaultState records the back buffer as bound but does not
-		// bind it, so ToneAdjust then skips its bind of the back buffer. ReShade restores the state that it changes
+		// The composite callback does not use SetDefaultState. SetDefaultState records the back buffer as bound but does
+		// not bind it, so ToneAdjust then skips its bind of the back buffer. ReShade restores the state that it changes
 		context->SortKey = top | BeforeToneAdjust;
 		this.QueueCallback(context, this.compositeFunction, false, (nint)target, (nint)ui, (nint)scene, effects ? 1 : 0);
 
-		// Frame generation libraries change state freely: the game resets its state cache around it, like for DLSS
+		// Frame generation libraries change state freely. The game resets its state cache around the callback, like
+		// for DLSS.
 		context->SortKey = top | AfterToneAdjust;
 		this.QueueCallback(context, this.regenerateFunction, generate, (nint)ui, (nint)scene, (nint)source, 0);
 		if (source != null && toneAdjust && finished != null)
@@ -279,7 +291,10 @@ public unsafe class UiLayer: IDisposable
 		context->ViewIndex = view;
 	}
 
-	/// <summary>defaultState: ImmediateContextDX11.SetDefaultState before and after, for callbacks that change state directly</summary>
+	/// <summary>
+	/// When defaultState is true, ImmediateContextDX11.SetDefaultState runs before and after the callback. Use it for
+	/// callbacks that change state directly.
+	/// </summary>
 	private void QueueCallback(Context* context, nint function, bool defaultState, nint first, nint second, nint third, nint fourth)
 	{
 		byte* command = (byte*)context->AllocateCommand((ulong)(CallbackSize + 4 * sizeof(nint)));
@@ -298,7 +313,10 @@ public unsafe class UiLayer: IDisposable
 		context->PushBackCommand(command);
 	}
 
-	/// <summary>The game's ToneAdjust chain once more, from our source into our target; its own input and output restored after</summary>
+	/// <summary>
+	/// Queues the game's ToneAdjust chain once more, from our source into our target. Restores the chain's own input
+	/// and output after.
+	/// </summary>
 	private void QueueToneAdjust(PostEffectManager* postEffects, KernelTexture* source, KernelTexture* target)
 	{
 		PostEffectChain* chain = (PostEffectChain*)((byte*)postEffects + ToneAdjustChainOffset);
@@ -331,9 +349,10 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread: nameplates draw into the final target with the display depth bound (view 30, sort key 0xCE..., before the
-	/// 2D UI), depth tested against the scene. That bind gets the layer as render target 0 instead, the depth stays, so
-	/// they're occluded as before and drawn into the layer like the rest of the UI
+	/// Render thread. Nameplates draw into the final target with the display depth bound (view 30, sort key 0xCE...,
+	/// before the 2D UI). The game depth tests them against the scene. This detour changes render target 0 of that bind
+	/// to the layer. The depth stays bound. Thus the scene occludes the nameplates as before, and they draw into the
+	/// layer like the rest of the UI.
 	/// </summary>
 	private void SetTargetDetour(ImmediateContext* context, nint command)
 	{
@@ -354,7 +373,8 @@ public unsafe class UiLayer: IDisposable
 	/// <summary>Render thread, every draw</summary>
 	private void SetBlendStateDetour(ImmediateContext* context, uint state)
 	{
-		// Render target 0 (+0x28, set by CommandSetRenderTarget); Dalamud's ClientStructs has no CurrentRenderTargets yet
+		// Render target 0 (+0x28). CommandSetRenderTarget sets it.
+		// Dalamud's ClientStructs has no CurrentRenderTargets yet.
 		nint ui = this.layer;
 #pragma warning disable CS0618
 		if (ui != 0 && (nint)context->BackBufferReference == ui)
@@ -368,8 +388,11 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// Layer = colour + layer * (1 - coverage) for every blend the UI uses, so it composites as premultiplied alpha.
-	/// Coverage follows the colour's destination term: kept for additive, replaced for opaque, (1 - src alpha) otherwise.
+	/// Makes every blend that the UI uses give layer = colour + layer * (1 - coverage). Thus the layer composites as
+	/// premultiplied alpha. Coverage follows the colour's destination term:
+	/// - Additive: coverage is kept.
+	/// - Opaque: coverage is replaced.
+	/// - Other blends: (1 - src alpha).
 	/// </summary>
 	internal static uint Premultiplied(uint key)
 	{
@@ -392,8 +415,8 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread, between the UI and ToneAdjust. Applies ReShade's effects to the scene, saves the scene and draws the
-	/// layer on the final target
+	/// Render thread, between the UI and ToneAdjust. Applies ReShade's effects to the scene, saves the scene and draws
+	/// the layer on the final target
 	/// </summary>
 	private void Composite(nint* arguments)
 	{
@@ -428,8 +451,8 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread, after ToneAdjust: the generated frame (or this frame's scene again) + layer, for the regenerated frame's
-	/// ToneAdjust; layer cleared
+	/// Render thread, after ToneAdjust. Draws the layer over the generated frame (or this frame's scene again) for the
+	/// regenerated frame's ToneAdjust. Clears the layer.
 	/// </summary>
 	private void Regenerate(nint* arguments)
 	{
@@ -464,9 +487,9 @@ public unsafe class UiLayer: IDisposable
 		(ID3D11RenderTargetView*)texture->GetMipRenderTarget(0)->D3D11RenderTargetViewOrDepthStencilView;
 
 	/// <summary>
-	/// Uses CopyResource when the D3D11 formats are the same, and a blit when they are different. The back buffer is R8G8B8A8
-	/// and our textures are B8G8R8A8. For a source without a shader view (the back buffer), the blit reads a copy in its own
-	/// format
+	/// Uses CopyResource when the D3D11 formats are the same, and a blit when they are different. The back buffer is
+	/// R8G8B8A8 and our textures are B8G8R8A8. For a source without a shader view (the back buffer), the blit reads a
+	/// copy in its own format
 	/// </summary>
 	private void Copy(ID3D11DeviceContext* context, KernelTexture* target, KernelTexture* source)
 	{
@@ -483,8 +506,8 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// Copies the texture into a texture with a shader view and returns that view. Recreates the copy when the size or format
-	/// changes
+	/// Copies the texture into a texture with a shader view and returns that view. Recreates the copy when the size or
+	/// format changes
 	/// </summary>
 	private ID3D11ShaderResourceView* ReadableCopy(ID3D11DeviceContext* context, ID3D11Texture2D* texture)
 	{
@@ -515,8 +538,8 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// Source over the target, premultiplied alpha blended or copied, in a context state of its own: the game's bindings and
-	/// its state cache stay as they were
+	/// Draws the source over the target with a premultiplied alpha blend, or copies it. The draw uses its own context
+	/// state, so the game's bindings and its state cache stay as they were.
 	/// </summary>
 	private void Draw(ID3D11DeviceContext* context, KernelTexture* target, KernelTexture* ui, bool blend) =>
 		this.Draw(context, target, (ID3D11ShaderResourceView*)ui->D3D11ShaderResourceView, blend);
@@ -540,7 +563,7 @@ public unsafe class UiLayer: IDisposable
 		context->PSSetShaderResources(0, 1, &layerView);
 		context->Draw(3, 0);
 
-		// Bindings held in an inactive state would keep the targets referenced, through ResizeBuffers too
+		// An inactive state that holds bindings would keep references to the targets, also through ResizeBuffers
 		ID3D11ShaderResourceView* noView = null;
 		context->PSSetShaderResources(0, 1, &noView);
 		context->OMSetRenderTargets(0, null, null);
@@ -559,7 +582,7 @@ public unsafe class UiLayer: IDisposable
 			ID3D11Device1* device1 = Dx.Query<ID3D11Device1>(device);
 			D3D_FEATURE_LEVEL level = device->GetFeatureLevel();
 			ID3DDeviceContextState* created;
-			// Has to match a single threaded device
+			// The state must match a single threaded device
 			uint flags = (device->GetCreationFlags() & (uint)D3D11_CREATE_DEVICE_FLAG.D3D11_CREATE_DEVICE_SINGLETHREADED) != 0
 				? (uint)D3D11_1_CREATE_DEVICE_CONTEXT_STATE_FLAG.D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED
 				: 0;
@@ -588,7 +611,10 @@ public unsafe class UiLayer: IDisposable
 		}
 	}
 
-	/// <summary>Framework thread: no new callbacks, queued ones do nothing; then wait for the render thread before Dispose</summary>
+	/// <summary>
+	/// Framework thread. Stops new callbacks, and queued callbacks do nothing. After this call, wait for the render
+	/// thread before Dispose.
+	/// </summary>
 	public void Stop() => this.stopped = true;
 
 	public void Dispose()

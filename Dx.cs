@@ -60,7 +60,7 @@ public static unsafe class Dx
 		return texture;
 	}
 
-	/// <summary>All mips, the texture's own format unless given</summary>
+	/// <summary>Creates a view of all mips. Uses the texture's own format unless a format is given</summary>
 	public static ID3D11ShaderResourceView* CreateSrv(ID3D11Device* device, void* texture, DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN)
 	{
 		D3D11_SHADER_RESOURCE_VIEW_DESC desc = new() { Format = format, ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D };
@@ -152,7 +152,7 @@ public static unsafe class Dx
 		context->Unmap((ID3D11Resource*)buffer, 0);
 	}
 
-	/// <summary>View format for a typeless depth texture, other formats as is</summary>
+	/// <summary>Returns the view format for a typeless depth texture. Returns other formats as is</summary>
 	public static DXGI_FORMAT ReadableFormat(DXGI_FORMAT format) => format switch
 	{
 		DXGI_FORMAT_R24G8_TYPELESS => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,

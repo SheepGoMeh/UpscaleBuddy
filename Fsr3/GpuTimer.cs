@@ -8,7 +8,7 @@ using static TerraFX.Interop.Windows.Windows;
 namespace UpscaleBuddy.Fsr3;
 
 /// <summary>
-/// D3D11 timestamps at a few marks per frame, read back frames later without stalling
+/// D3D11 timestamps at a few marks per frame. The timer reads them back frames later, without a stall.
 /// </summary>
 public unsafe class GpuTimer: IDisposable
 {
@@ -65,7 +65,7 @@ public unsafe class GpuTimer: IDisposable
 		this.pending[this.slot] = true;
 	}
 
-	/// <summary>Never flushes, a result that isn't ready stays pending</summary>
+	/// <summary>Never flushes. A result that isn't ready stays pending.</summary>
 	private void Read(ID3D11DeviceContext* context)
 	{
 		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
@@ -85,7 +85,7 @@ public unsafe class GpuTimer: IDisposable
 		if (disjoint.Disjoint)
 			return;
 
-		// Marks around a cross-queue fence wait can come back out of order, the sample is useless then
+		// Marks around a cross-queue fence wait can come back out of order. The sample is then useless.
 		for (int i = 1; i < marks; i++)
 		{
 			if (stamps[i] < stamps[i - 1])

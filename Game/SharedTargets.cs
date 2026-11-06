@@ -11,19 +11,21 @@ using KernelTexture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Gives SceneInput, SceneOutput and velocity NT shared D3D11 textures, so D3D12 opens them without copies
-/// Uses the game's texture aliasing: a Kernel::Texture whose source (+0xC0) is set takes the source's ID3D11Texture2D
-/// instead of creating one and builds its own views on it (sub_140218520). After the game recreates its render targets
-/// (Device.OnResizeCreate, PostTick with the render thread idle) each target is released and recreated on a source holding
-/// our shared texture. The game's own release pass (Device.OnResizeDestroy, sub_140216C00) drops the source again, so a
-/// reallocation while disabled gives the game its own textures back
+/// Gives SceneInput, SceneOutput and velocity NT shared D3D11 textures, so D3D12 opens them without copies.
+/// Uses the game's texture aliasing. A Kernel::Texture whose source (+0xC0) is set takes the ID3D11Texture2D of the
+/// source and does not create one. It builds its own views on that texture (sub_140218520).
+/// The game recreates its render targets in Device.OnResizeCreate (PostTick, with the render thread idle). After that,
+/// SharedTargets releases each target and recreates it on a source that holds our shared texture.
+/// The game's own release pass (Device.OnResizeDestroy, sub_140216C00) drops the source again. So a reallocation while
+/// disabled gives the game its own textures back
 /// </summary>
 public unsafe class SharedTargets: IDisposable
 {
 	// Kernel::Texture: releases the D3D11 resource, views and source
 	private const string ReleaseResourcesSignature = "40 53 41 54 48 83 EC ?? 48 8B 91";
 
-	// Kernel::Texture: sets the size (and mips, and format unless 0), then creates the D3D11 resource and views; on failure releases
+	// Kernel::Texture: sets the size (and mips, and format unless 0). Then creates the D3D11 resource and views. On
+	// failure, releases the texture
 	private const string ResizeSignature = "E8 ?? ?? ?? ?? 84 C0 75 ?? EB ?? 8B 47";
 
 	private const int SourceTextureOffset = 0xC0; // Kernel::Texture*, the texture whose D3D11 resource this one aliases
@@ -39,7 +41,7 @@ public unsafe class SharedTargets: IDisposable
 	private readonly delegate* unmanaged<KernelTexture*, void> releaseResources;
 	private readonly delegate* unmanaged<KernelTexture*, uint*, byte, uint, byte> resize;
 
-	// Kept alive here, the game calls it from PostTick
+	// The delegate stays alive here because the game calls it from PostTick
 	private readonly CallbackDelegate recreateCallback;
 	private readonly int callbackIndex;
 	private volatile bool enabled;
@@ -54,7 +56,7 @@ public unsafe class SharedTargets: IDisposable
 		this.releaseResources = (delegate* unmanaged<KernelTexture*, void>)Service.SigScanner.ScanText(ReleaseResourcesSignature);
 		this.resize = (delegate* unmanaged<KernelTexture*, uint*, byte, uint, byte>)Service.SigScanner.ScanText(ResizeSignature);
 
-		// Has to run after RenderTargetManager's own callback, which recreates the targets
+		// This callback must run after RenderTargetManager's own callback. That callback recreates the targets
 		this.recreateCallback = this.OnResizeCreate;
 		this.callbackIndex = device->OnResizeCreate->AddCallback(
 			(delegate* unmanaged<void*, bool>)Marshal.GetFunctionPointerForDelegate(this.recreateCallback), null);
@@ -74,7 +76,7 @@ public unsafe class SharedTargets: IDisposable
 		set => this.enabled = value;
 	}
 
-	/// <summary>PostTick, right after the game recreated its render targets; never fails the game's reset</summary>
+	/// <summary>PostTick, right after the game recreates its render targets. Never fails the game's reset</summary>
 	private byte OnResizeCreate(void* context)
 	{
 		if (!this.enabled)
@@ -98,7 +100,10 @@ public unsafe class SharedTargets: IDisposable
 		return 1;
 	}
 
-	/// <summary>Recreates the target on a source holding our shared texture, the game's texture when anything fails</summary>
+	/// <summary>
+	/// Recreates the target on a source that holds our shared texture. When anything fails, the target gets the game's
+	/// texture
+	/// </summary>
 	private void TakeOver(KernelTexture* target)
 	{
 		ID3D11Texture2D* gameTexture = (ID3D11Texture2D*)target->D3D11Texture2D;
@@ -118,7 +123,8 @@ public unsafe class SharedTargets: IDisposable
 			return;
 		}
 
-		// Immutable: the game creates the Kernel::Texture without a D3D11 resource, the source takes ours (and releases it)
+		// With Immutable, the game creates the Kernel::Texture without a D3D11 resource. The source takes ours (and
+		// releases it)
 		uint* size = stackalloc uint[2] { target->AllocatedWidth, target->AllocatedHeight };
 		KernelTexture* source = Device.Instance()->CreateTexture2D((int*)size, target->MipLevel, target->TextureFormat,
 			target->Flags | TextureFlags.Immutable, AllocationClass);
@@ -139,7 +145,7 @@ public unsafe class SharedTargets: IDisposable
 		if (aliased)
 			return;
 
-		// The failed resize released the target and dropped the source, give it the game's own texture back
+		// The failed resize released the target and dropped the source. Give the target the game's own texture back
 		Service.PluginLog.Warning($"Render target {desc.Width}x{desc.Height} didn't take the shared texture, recreating the game's");
 		if (this.resize(target, size, target->MipLevel, 0) == 0)
 			Service.PluginLog.Error($"Render target {desc.Width}x{desc.Height} couldn't be recreated");

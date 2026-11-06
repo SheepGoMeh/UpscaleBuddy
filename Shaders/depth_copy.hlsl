@@ -1,4 +1,4 @@
-// Game depth (R24G8, not shareable) to an R32_FLOAT twin that D3D12 can open
+// Copies game depth (R24G8, not shareable) to an R32_FLOAT twin that D3D12 can open
 
 Texture2D<float> Source : register(t0);
 RWTexture2D<float> Output : register(u0);

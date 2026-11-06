@@ -17,16 +17,19 @@ using KernelTexture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// The upscalers' reactive mask from rain and VFX coverage, which the game writes into a second render target in the depth of
-/// field effect mask variants of WeatherRenderer and Apricot (RTM+0x680, render target 1 next to SceneInput). Normal play doesn't
-/// use those variants: they need PostEffectFlags.DepthOfField and DepthOfField.UseUpdatedDepthOfField.
-/// - WeatherRenderer.Render to its finish (sub_1402ABEA0, after its jobs are joined): both set, so its draws use the variant. In
-///   that span of Manager.RenderView only the weather reads them; PostEffectManager.Submit, the depth of field's user, ran before.
-/// - Manager.Render's copy of the condition for Apricot (sub_140393730, after all views): true.
-/// - Context.SetRenderTargets: render target 1 of those binds is ours, so the game's depth of field parameters stay untouched and
-///   ours holds only the effects' coverage, in alpha.
-/// None of it while the game's own depth of field uses the mask.
-/// Render thread, at the upscaler: alpha x responsiveness into an R8 texture shared with D3D12, ours cleared for the next frame.
+/// The reactive mask of the upscalers, from rain and VFX coverage. The game writes this coverage into a second render
+/// target in the depth of field effect mask variants of WeatherRenderer and Apricot. That target is RTM+0x680, render
+/// target 1 next to SceneInput. Normal play does not use those variants. They need PostEffectFlags.DepthOfField and
+/// DepthOfField.UseUpdatedDepthOfField. EffectMask changes the game as follows:
+/// - From WeatherRenderer.Render to its finish (sub_1402ABEA0, after its jobs are joined), both flags are set. So the
+///   draws of the weather use the variant. In that span of Manager.RenderView, only the weather reads the flags.
+///   PostEffectManager.Submit, the user of the depth of field, ran before.
+/// - Manager.Render's copy of the condition for Apricot (sub_140393730, after all views) is true.
+/// - In Context.SetRenderTargets, render target 1 of those binds is ours. So the game's depth of field parameters stay
+///   untouched. Ours holds only the coverage of the effects, in alpha.
+/// EffectMask does none of this while the game's own depth of field uses the mask.
+/// Render thread, at the upscaler. Writes alpha x responsiveness into an R8 texture shared with D3D12. Then clears ours
+/// for the next frame.
 /// </summary>
 public unsafe class EffectMask: IDisposable
 {
@@ -46,8 +49,8 @@ public unsafe class EffectMask: IDisposable
 		public float Padding0, Padding1, Padding2;
 	}
 
-	// Ghidra has these as void, IDA's Render returns rax: passed through. SetRenderTargets as ClientStructs documents it, which
-	// Dalamud's hook verification requires
+	// Ghidra types these as void. IDA's Render returns rax, so the hook passes it through. SetRenderTargets uses the
+	// signature that ClientStructs documents, because Dalamud's hook verification requires it
 	private delegate nint WeatherRenderDelegate(nint renderer);
 	private delegate void WeatherFinishDelegate(nint renderer);
 	private delegate void EffectsMaskEnabledDelegate(byte enabled);
@@ -59,7 +62,7 @@ public unsafe class EffectMask: IDisposable
 	private readonly Hook<EffectsMaskEnabledDelegate>? effectsMaskEnabledHook;
 	private readonly Hook<SetRenderTargetsDelegate>? setRenderTargetsHook;
 
-	// Framework thread writes, main and render thread read
+	// The framework thread writes these. The main thread and the render thread read them
 	private volatile bool active;
 	private volatile float responsiveness;
 
@@ -69,7 +72,7 @@ public unsafe class EffectMask: IDisposable
 	private bool savedUpdatedDepthOfField;
 	private bool loggedUnfinishedWeather;
 
-	// Main thread creates it, SetRenderTargets (any thread) and the render thread use it
+	// The main thread creates the mask. SetRenderTargets (any thread) and the render thread use it
 	private volatile nint mask;
 	private volatile bool redirectWeather;
 	private volatile bool redirectEffects;
@@ -114,7 +117,7 @@ public unsafe class EffectMask: IDisposable
 
 	public bool Available { get; }
 
-	/// <summary>Framework thread: on while an upscaler runs and responsiveness is above 0</summary>
+	/// <summary>Framework thread. Activates EffectMask while an upscaler runs and responsiveness is above 0</summary>
 	public void Configure(bool upscaling, float effectResponsiveness)
 	{
 		bool wasActive = this.active;
@@ -163,7 +166,7 @@ public unsafe class EffectMask: IDisposable
 		return result;
 	}
 
-	/// <summary>Main thread, Manager.RenderView: the renderer's jobs are joined in Original</summary>
+	/// <summary>Main thread, Manager.RenderView. Original joins the renderer's jobs</summary>
 	private void WeatherFinishDetour(nint renderer)
 	{
 		this.weatherFinishHook!.Original(renderer);
@@ -181,7 +184,8 @@ public unsafe class EffectMask: IDisposable
 	/// <summary>Main thread, Manager.Render after all views, before Apricot's draws are built</summary>
 	private void EffectsMaskEnabledDetour(byte enabled)
 	{
-		// A weather renderer whose finish didn't run: the game's state back before anything else reads it, and its own condition
+		// The finish of a weather renderer did not run. Restore the game's state before anything else reads it.
+		// Also pass the game's own condition
 		if (this.forcedWeather.Count > 0)
 		{
 			if (!this.loggedUnfinishedWeather)
@@ -214,7 +218,10 @@ public unsafe class EffectMask: IDisposable
 		this.setRenderTargetsHook!.Original(context, count, redirected, depth, a4, a5, a6, a7);
 	}
 
-	/// <summary>Main thread: ours at the game mask's size, recreated when it changes; false when there's none</summary>
+	/// <summary>
+	/// Main thread. Fits ours to the size of the game mask and recreates ours when that size changes. Returns false
+	/// when there is no mask
+	/// </summary>
 	private bool FitMask()
 	{
 		KernelTexture* game = GameMask;
@@ -225,7 +232,7 @@ public unsafe class EffectMask: IDisposable
 		if (current != null && current->ActualWidth == game->ActualWidth && current->ActualHeight == game->ActualHeight)
 			return true;
 
-		// The game releases it once the frames using it are done
+		// The game releases it when the frames that use it are done
 		if (current != null)
 			current->DecRef();
 		current = KernelTexture.CreateTexture2D((int)game->ActualWidth, (int)game->ActualHeight, 1, TextureFormat.B8G8R8A8_UNORM, TargetFlags,
@@ -237,8 +244,9 @@ public unsafe class EffectMask: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread, at the upscaler, after the frame's effects: the reactive mask at the color's size, zero where nothing was drawn
-	/// or while off; ours cleared for the next frame. Null when unavailable
+	/// Render thread, at the upscaler, after the frame's effects. Returns the reactive mask at the size of the color.
+	/// The reactive mask is zero where nothing was drawn and while EffectMask is off. Clears ours for the next frame.
+	/// Returns null when unavailable
 	/// </summary>
 	public ID3D11Texture2D* Resolve(ID3D11DeviceContext* context, ID3D11Texture2D* color)
 	{
@@ -293,8 +301,9 @@ public unsafe class EffectMask: IDisposable
 	}
 
 	/// <summary>
-	/// R8 at this size, NT shared so the D3D12 upscalers open it directly; recreated when it changes. The upscalers keep their own
-	/// references to the old one as long as they cache it
+	/// Fits the R8 reactive texture to this size and recreates it when the size changes. The texture is NT shared, so
+	/// the D3D12 upscalers open it directly. The upscalers keep their own references to the old texture as long as they
+	/// cache it
 	/// </summary>
 	private void FitReactive(ID3D11DeviceContext* context, uint width, uint height)
 	{
@@ -323,7 +332,10 @@ public unsafe class EffectMask: IDisposable
 		this.reactiveWritten = true; // Undefined until cleared
 	}
 
-	/// <summary>Framework thread: hooks pass through, the render thread stops using it; then wait for the render thread before Dispose</summary>
+	/// <summary>
+	/// Framework thread. After this call, the hooks pass through and the render thread stops using EffectMask. Wait for
+	/// the render thread before Dispose
+	/// </summary>
 	public void Stop()
 	{
 		this.stopped = true;

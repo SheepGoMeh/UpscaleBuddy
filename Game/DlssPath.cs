@@ -26,8 +26,8 @@ using SceneCamera = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.Camera;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Runs FSR through the game's DLSS path by replacing the statically linked NGX calls
-/// Only active while the game's upscaler setting is AMD FSR
+/// Runs FSR through the game's DLSS path. It replaces the statically linked NGX calls.
+/// It is only active while the game's upscaler setting is AMD FSR.
 /// </summary>
 public unsafe class DlssPath: IDisposable
 {
@@ -39,12 +39,14 @@ public unsafe class DlssPath: IDisposable
 	private const string DestroyParametersSignature = "E8 ?? ?? ?? ?? 33 C9 E8 ?? ?? ?? ?? 80 A7";
 	private const string ShutdownSignature = "E8 ?? ?? ?? ?? 80 A3 ?? ?? ?? ?? ?? 48 8B 8B";
 
-	// FUN_1402db4f0, render target size: render resolution targets are allocated (FUN_1402dc1a0) and sized
-	// (FUN_1402dac20) from its result, clamped to the display height
+	// FUN_1402db4f0 gives the render target size. The game allocates the render resolution targets (FUN_1402dc1a0)
+	// and sizes them (FUN_1402dac20) from its result. The game clamps that result to the display height.
 	private const string RenderSizeSignature = "E8 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? B9";
 
-	// PostEffectManager setup (FUN_1403528a0) runs only on DLSS capable GPUs. It calls MemAlloc(0x188) and the ctor, stores
-	// the object at PostEffectManager+0x4220 and sets RenderTargetManager+0x730 to the render size callback
+	// The PostEffectManager setup (FUN_1403528a0) runs only on DLSS capable GPUs. It does these steps:
+	// - It calls MemAlloc(0x188) and the ctor.
+	// - It stores the object at PostEffectManager+0x4220.
+	// - It sets RenderTargetManager+0x730 to the render size callback.
 	private const string MemAllocSignature = "E8 ?? ?? ?? ?? 48 8B D8 41 B8";
 	private const string DlssObjectCtorSignature = "E8 ?? ?? ?? ?? EB ?? 49 8B C7 48 89 87 ?? ?? ?? ?? 48 8D 0D";
 	private const string RenderSizeCallbackSignature = "48 89 5C 24 ?? 48 89 74 24 ?? 48 89 7C 24 ?? 41 56 48 83 EC ?? 48 8B 05 ?? ?? ?? ?? 49 8B F9"; // FUN_140352350
@@ -107,7 +109,7 @@ public unsafe class DlssPath: IDisposable
 	private readonly nint renderSizeCallback;
 	private readonly nint featureHandle = System.Runtime.InteropServices.Marshal.AllocHGlobal(16);
 
-	// Written on the framework thread, read on the render thread
+	// The framework thread writes these. The render thread reads them.
 	private volatile float scale = 1.0f;
 	private volatile float supersample = 1.0f;
 	private float allocatedSupersample = 1.0f;
@@ -122,7 +124,8 @@ public unsafe class DlssPath: IDisposable
 	private volatile bool infiniteFar;
 	private volatile Upscaler selectedUpscaler;
 
-	// Framework thread writes, render thread reads; a frame's worth of tearing doesn't matter to frame generation
+	// The framework thread writes these. The render thread reads them.
+	// Tearing for one frame does not matter to frame generation.
 	private Vector3 cameraPosition, cameraUp, cameraRight, cameraForward;
 
 	// Render thread
@@ -136,20 +139,20 @@ public unsafe class DlssPath: IDisposable
 	private FrameInputs frame;
 	private volatile bool frameReady;
 
-	// Render thread sets it when the upscaler can't start or dispatch, the framework thread releases
+	// The render thread sets it when the upscaler cannot start or dispatch. The framework thread then releases.
 	private volatile string? failure;
 
-	// Framework thread: the settings that failed, not retried until they change
+	// Framework thread. The settings that failed. The plugin does not retry them until they change.
 	private (Upscaler, UpscaleMode)? failedSettings;
 
-	// Framework thread: when the upscaler was restarted after a failure
+	// Framework thread. The times when the upscaler restarted after a failure.
 	private readonly Queue<long> restarts = new();
 
 	// Framework thread
 	private volatile State state = State.Idle;
 	private bool hooksEnabled;
 
-	// The game's own NGX runs; only the evaluate hook is on, to read the frame's inputs for frame generation
+	// The game's own NGX runs. Only the evaluate hook is on. It reads the frame's inputs for frame generation.
 	private volatile bool nativeHooked;
 	private bool supportChecked;
 	// NGX state of the DLSS object and the render size callback before activation
@@ -202,7 +205,7 @@ public unsafe class DlssPath: IDisposable
 			Service.PluginLog.Warning(e, "DlssPath unavailable");
 		}
 
-		// Optional, without it the AMD DLL path copies its inputs
+		// Optional. Without it, the AMD DLL path copies its inputs.
 		if (this.Available)
 		{
 			try
@@ -216,7 +219,7 @@ public unsafe class DlssPath: IDisposable
 		}
 	}
 
-	/// <summary>Render thread: whether this frame resets the upscaler history, after a start</summary>
+	/// <summary>Render thread. True when this frame resets the upscaler history after a start.</summary>
 	private bool TakeResetFrame()
 	{
 		int left = this.resetFrames;
@@ -242,12 +245,12 @@ public unsafe class DlssPath: IDisposable
 	public bool Running => (this.state == State.Active || this.nativeHooked) && this.OutputWidth != 0;
 
 	/// <summary>
-	/// An NVIDIA GPU the game itself made its DLSS object for, so its NGX works; the DLSS entry is only offered then. Known once the
-	/// renderer is up
+	/// True on an NVIDIA GPU that the game itself made its DLSS object for. On that GPU, the game's NGX works.
+	/// The DLSS entry is only offered then. The value is known after the renderer starts.
 	/// </summary>
 	public bool NativeDlssSupported { get; private set; }
 
-	/// <summary>The upscaler the shim uses: DLSS isn't one of its backends</summary>
+	/// <summary>The upscaler that the shim uses. DLSS is not one of its backends.</summary>
 	private Upscaler ShimUpscaler => this.configuration.Upscaler == Upscaler.NvidiaDlss ? Upscaler.BuiltInFsr3 : this.configuration.Upscaler;
 
 	public double CpuMs { get; private set; }
@@ -278,8 +281,9 @@ public unsafe class DlssPath: IDisposable
 		Service.GameConfig.TryGet(SystemConfigOption.GraphicsRezoUpscaleType, out uint value) && value == SettingNvidiaDlss;
 
 	/// <summary>
-	/// The game makes its DLSS object only for a GPU it finds DLSS capable, so the object's existence before the shim allocated its
-	/// own, on an NVIDIA adapter (a leftover shim object on another vendor's GPU doesn't count)
+	/// The game makes its DLSS object only for a GPU that it finds DLSS capable.
+	/// Thus native support is the object's existence before the shim allocates its own, on an NVIDIA adapter.
+	/// A leftover shim object on another vendor's GPU does not count.
 	/// </summary>
 	private void CheckNativeSupport()
 	{
@@ -318,8 +322,8 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Framework thread: the game's own DLSS runs untouched (its setting, quality and DLAA choice); the evaluate hook only reads the
-	/// frame's inputs, for frame generation
+	/// Framework thread. The game's own DLSS runs untouched, with its own setting, quality and DLAA choice.
+	/// The evaluate hook only reads the frame's inputs for frame generation.
 	/// </summary>
 	private void UpdateNative(bool selected)
 	{
@@ -361,8 +365,10 @@ public unsafe class DlssPath: IDisposable
 		this.UpdateNative(native);
 		bool wanted = !native && this.configuration.Mode != UpscaleMode.Off && GameSettingIsFsr();
 
-		// A failed start or dispatch: first a restart of the upscaler (a fresh D3D12 device and context), and when that keeps failing
-		// the game's own upscaler back instead of its render size picture, until the settings change
+		// After a failed start or dispatch:
+		// - First, the plugin restarts the upscaler with a new D3D12 device and context.
+		// - When that continues to fail, the game gets its own upscaler back until the settings change.
+		//   The game then does not show its render size picture.
 		string? failed = this.failure;
 		if (failed != null && this.state == State.Active)
 		{
@@ -404,9 +410,9 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Framework thread: retires the failed upscaler and has the game create the feature again, which builds a new one. History is
-	/// reset for the first frames. False once it has restarted MaxRestarts times within RestartWindowSeconds, the failure is then
-	/// persistent
+	/// Framework thread. Retires the failed upscaler and makes the game create the feature again.
+	/// The game then builds a new upscaler. Resets the history for the first frames.
+	/// Returns false after MaxRestarts restarts within RestartWindowSeconds. The failure is then persistent.
 	/// </summary>
 	private bool Restart(string reason)
 	{
@@ -450,12 +456,13 @@ public unsafe class DlssPath: IDisposable
 			*(nint*)(postEffectManager + DlssObjectOffset) = this.dlssObjectCtor(dlssObject);
 		}
 
-		// The game re-runs NGX init through the hooks, the previous state is put back on release
+		// The game runs NGX init again through the hooks. The release puts the previous state back.
 		this.savedFlags = (byte)(*(byte*)(dlssObject + StateFlagsOffset) & 3);
 		this.savedParameters = *(nint*)(dlssObject + ParametersOffset);
 		this.savedFeature = *(nint*)(dlssObject + FeatureOffset);
 		*(byte*)(dlssObject + StateFlagsOffset) &= 0xFE;
-		this.InvalidateFeature(); // The cached settings survive a plugin reload, without this the game never creates
+		// The cached settings survive a plugin reload. Without this, the game never creates the feature.
+		this.InvalidateFeature();
 
 		this.savedRenderSizeCallback = *(nint*)(renderTargetManager + RenderSizeCallbackOffset);
 		*(nint*)(renderTargetManager + RenderSizeCallbackOffset) = this.renderSizeCallback;
@@ -499,7 +506,7 @@ public unsafe class DlssPath: IDisposable
 			this.InvalidateFeature();
 		}
 
-		// Reallocate so the targets D3D12 reads are created shared, or plain again
+		// Reallocate the targets that D3D12 reads. The game then creates them shared, or plain again.
 		bool share = this.selectedUpscaler != Upscaler.BuiltInFsr3 && this.configuration.ZeroCopy;
 		if (this.sharedTargets != null && this.sharedTargets.Enabled != share)
 		{
@@ -522,13 +529,13 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Restores the game's upscaler, the DLSS object state is restored a few frames later
+	/// Restores the game's upscaler. FinishRelease restores the DLSS object state a few frames later.
 	/// </summary>
 	private void BeginRelease(string status)
 	{
 		GraphicsConfig.Instance()->GraphicsRezoUpscaleType = GameSettingIsFsr() ? UpscaleTypeFsr : UpscaleTypeDlss;
 		this.supersample = 1.0f;
-		this.allocatedSupersample = 0; // Back to the game's render size, the targets unshared
+		this.allocatedSupersample = 0; // Back to the game's render size. The targets are unshared.
 		if (this.sharedTargets != null)
 			this.sharedTargets.Enabled = false;
 		this.selectedUpscaler = Upscaler.BuiltInFsr3;
@@ -547,7 +554,7 @@ public unsafe class DlssPath: IDisposable
 		byte* renderTargetManager = (byte*)RenderTargetManager.Instance();
 		nint dlssObject = postEffectManager == null ? 0 : *(nint*)(postEffectManager + DlssObjectOffset);
 
-		// Textures stay with the game, RenderTargetManager can still use the DLSS output as its final target
+		// The textures stay with the game. RenderTargetManager can still use the DLSS output as its final target.
 		if (dlssObject != 0)
 		{
 			*(byte*)(dlssObject + StateFlagsOffset) = (byte)((*(byte*)(dlssObject + StateFlagsOffset) & 0xFC) | this.savedFlags);
@@ -561,7 +568,7 @@ public unsafe class DlssPath: IDisposable
 
 		this.EnableHooks(false);
 
-		// No evaluate is queued anymore after the release frames
+		// After the release frames, no evaluate is in the queue.
 		lock (this.upscalerLock)
 		{
 			this.upscaler?.Dispose();
@@ -575,7 +582,8 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Same fields the game resets after releasing the feature (FUN_140373d10), the next frame creates it again
+	/// Resets the same fields that the game resets after it releases the feature (FUN_140373d10).
+	/// The next frame then creates the feature again.
 	/// </summary>
 	private void InvalidateFeature()
 	{
@@ -592,7 +600,8 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Render resolution targets are only allocated on a device resize, request one at the same size
+	/// The game allocates the render resolution targets only on a device resize.
+	/// This requests a resize at the same size.
 	/// </summary>
 	private void RequestReallocation()
 	{
@@ -623,8 +632,9 @@ public unsafe class DlssPath: IDisposable
 		this.cameraFar = renderCamera->FarPlane;
 		this.infiniteFar = !renderCamera->FiniteFarPlane;
 
-		// Basis from the view matrix columns; forward's sign from where the camera looks, the handedness isn't assumed.
-		// ponytail: only FSR 4 frame generation (RX 9000) depends on these, unverified there
+		// The basis comes from the view matrix columns. The sign of forward comes from where the camera looks.
+		// The code does not assume the handedness.
+		// ponytail: only FSR 4 frame generation (RX 9000) depends on these. They are unverified there.
 		Matrix4x4 view = renderCamera->ViewMatrix;
 		Vector3 position = renderCamera->Origin;
 		Vector3 forward = Vector3.Normalize(new Vector3(view.M13, view.M23, view.M33));
@@ -636,7 +646,10 @@ public unsafe class DlssPath: IDisposable
 		this.cameraForward = forward;
 	}
 
-	/// <summary>Render thread: this frame's upscaler inputs for frame generation, once; false when the upscaler didn't run</summary>
+	/// <summary>
+	/// Render thread. Gives this frame's upscaler inputs for frame generation, once.
+	/// Returns false when the upscaler did not run.
+	/// </summary>
 	public bool TakeFrame(out FrameInputs frame)
 	{
 		frame = this.frame;
@@ -679,7 +692,8 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Display size times the supersampling factor, allocation and per frame size alike
+	/// Sets the size to the display size times the supersampling factor.
+	/// This applies to the allocation size and to the per frame size.
 	/// </summary>
 	private void RenderSizeDetour(nint renderTargetManager, uint* size, byte allocate)
 	{
@@ -694,7 +708,7 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Render size for the configured mode, regardless of the DLSS quality
+	/// Sets the render size for the configured mode. The DLSS quality has no effect on it.
 	/// </summary>
 	private int OptimalSettings(nint _)
 	{
@@ -711,7 +725,10 @@ public unsafe class DlssPath: IDisposable
 		return NgxParameters.Success;
 	}
 
-	/// <summary>A D3D12 library on the shim, created with the device the shim makes; reactive: every dispatch has a reactive mask</summary>
+	/// <summary>
+	/// A D3D12 library on the shim. It uses the device that the shim makes.
+	/// When reactive is true, every dispatch has a reactive mask.
+	/// </summary>
 	private static IUpscaler CreateD3D12(ID3D11Device* device, Upscaler selected, uint renderWidth, uint renderHeight, uint upscaleWidth,
 		uint upscaleHeight, bool infiniteFar, bool reactive) => selected switch
 	{
@@ -723,7 +740,7 @@ public unsafe class DlssPath: IDisposable
 	};
 
 	/// <summary>
-	/// Render thread, command from FUN_140374a60
+	/// Render thread. The command comes from FUN_140374a60.
 	/// </summary>
 	private int CreateDetour(ID3D11DeviceContext* context, int feature, nint parameterObject, nint* handle)
 	{
@@ -743,8 +760,8 @@ public unsafe class DlssPath: IDisposable
 			Upscaler selected = this.selectedUpscaler;
 			UpscalerKey key = new((nint)device, selected, renderWidth, renderHeight, outputWidth, outputHeight, this.infiniteFar);
 
-			// The game releases and creates the feature on a window resize or an alt+tab too, a running upscaler of the same
-			// kind and sizes stays as it is
+			// The game also releases and creates the feature on a window resize or an alt+tab.
+			// A running upscaler of the same kind and sizes stays as it is.
 			lock (this.upscalerLock)
 			{
 				if (this.upscaler != null && this.createdKey == key)
@@ -756,7 +773,7 @@ public unsafe class DlssPath: IDisposable
 				this.downsampler = null;
 			}
 
-			// Supersampling: FSR at the render size, then down to the output
+			// Supersampling runs FSR at the render size, then scales down to the output.
 			bool supersampling = renderWidth > outputWidth;
 			uint upscaleWidth = supersampling ? renderWidth : outputWidth;
 			uint upscaleHeight = supersampling ? renderHeight : outputHeight;
@@ -795,8 +812,8 @@ public unsafe class DlssPath: IDisposable
 		}
 		catch (Exception e)
 		{
-			// Evaluate would fail every frame and the game show its render size picture: the framework thread gives the game
-			// its own upscaler back
+			// Else evaluate fails every frame and the game shows its render size picture.
+			// The framework thread gives the game its own upscaler back.
 			this.failure = $"Failed to start: {e.Message}";
 			Service.PluginLog.Error(e, "FSR context creation failed");
 		}
@@ -809,7 +826,7 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread, command from PostEffectManager.Submit
+	/// Render thread. The command comes from PostEffectManager.Submit.
 	/// </summary>
 	private int EvaluateDetour(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
 	{
@@ -830,7 +847,7 @@ public unsafe class DlssPath: IDisposable
 			currentDownsampler = this.downsampler;
 		}
 
-		// NGX resources, all 2D textures here
+		// The NGX resources here are all 2D textures.
 		Fsr3Upscaler.DispatchParams dispatch = new()
 		{
 			Color = (ID3D11Texture2D*)this.parameters.Pointer("Color"),
@@ -867,7 +884,7 @@ public unsafe class DlssPath: IDisposable
 		ID3D11Texture2D* gameOutput = dispatch.Output;
 		if (currentDownsampler != null)
 		{
-			// Until the requested resize has run the game still renders at the display size
+			// Until the requested resize runs, the game still renders at the display size.
 			D3D11_TEXTURE2D_DESC colorDesc = Dx.GetDesc(dispatch.Color);
 			if (colorDesc.Width < current.MaxRenderWidth || colorDesc.Height < current.MaxRenderHeight)
 			{
@@ -893,7 +910,7 @@ public unsafe class DlssPath: IDisposable
 				this.CpuMs = (this.CpuMs * 0.9) + (ms * 0.1);
 			}
 
-			// Still valid at the end of the frame, after ToneAdjust, where frame generation reads them
+			// These stay valid at the end of the frame, after ToneAdjust. Frame generation reads them there.
 			this.frame = new FrameInputs
 			{
 				Depth = dispatch.Depth,
@@ -933,9 +950,10 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread, the game's own DLSS: it runs as it is with the effects' reactive mask as its bias towards the current color,
-	/// and the inputs it was given are kept for frame generation (the same parameters the shim reads, from the game's real NGX
-	/// parameter object)
+	/// Render thread. The game's own DLSS runs as it is.
+	/// The effects' reactive mask is its bias towards the current color.
+	/// This keeps the inputs of the game's DLSS for frame generation.
+	/// These are the same parameters that the shim reads, from the game's real NGX parameter object.
 	/// </summary>
 	private int EvaluateNative(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
 	{
@@ -992,11 +1010,11 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Framework thread, the upscaler is freed on the render thread
+	/// Framework thread. The render thread frees the upscaler.
 	/// </summary>
 	private int ReleaseDetour(nint handle) => NgxParameters.Success;
 
-	/// <summary>Hands the upscaler and downsampler over to the render thread, which disposes them</summary>
+	/// <summary>Gives the upscaler and downsampler to the render thread. The render thread disposes them.</summary>
 	private void RetireUpscaler()
 	{
 		lock (this.upscalerLock)
@@ -1021,7 +1039,7 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Unload, restores the game's upscaler
+	/// Unload. Restores the game's upscaler.
 	/// </summary>
 	public void Stop()
 	{
@@ -1030,7 +1048,7 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Unload, restores the DLSS object state
+	/// Unload. Restores the DLSS object state.
 	/// </summary>
 	public void Finish()
 	{

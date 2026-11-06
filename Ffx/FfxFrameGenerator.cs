@@ -13,9 +13,10 @@ using static UpscaleBuddy.Ffx.FfxApi;
 namespace UpscaleBuddy.Ffx;
 
 /// <summary>
-/// AMD's frame generation DLL (FidelityFX SDK 2.x) over the bridge: FSR 4 frame generation where the provider supports it
-/// (RX 9000), FSR 3.1 elsewhere. Without AMD's swapchain (FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY): configure,
-/// prepare and dispatch each frame, the generated frame into our own output
+/// AMD's frame generation DLL (FidelityFX SDK 2.x) over the bridge.
+/// It uses FSR 4 frame generation where the provider supports it (RX 9000), and FSR 3.1 elsewhere.
+/// It does not use AMD's swapchain (FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY).
+/// Each frame, it calls configure, prepare and dispatch, and writes the generated frame into our own output.
 /// </summary>
 public unsafe class FfxFrameGenerator: IFrameGenerator
 {
@@ -166,7 +167,7 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 		Twin? directMotion = this.bridge.Direct(inputs.MotionVectors);
 		Twin motionTwin = directMotion ?? (this.motionVectors ??= this.bridge.CreateTwin(motionDesc.Format, motionDesc.Width, motionDesc.Height));
 
-		// D3D11: inputs into the twins unless D3D12 reads them directly
+		// D3D11 copies the inputs into the twins, unless D3D12 reads them directly
 		Bridge.Copy(d3d11, sceneTwin.Texture11, inputs.Scene, sceneTwin.Input);
 		if (directMotion == null)
 			Bridge.Copy(d3d11, motionTwin.Texture11, inputs.MotionVectors, motionTwin.Input);

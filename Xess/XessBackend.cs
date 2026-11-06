@@ -12,8 +12,8 @@ using static TerraFX.Interop.DirectX.D3D12_RESOURCE_STATES;
 namespace UpscaleBuddy.Xess;
 
 /// <summary>
-/// Intel's XeSS super resolution (libxess.dll, XeSS SDK 3.x) through its D3D12 API, which runs on any GPU with DP4a
-/// Inputs are expected in NON_PIXEL_SHADER_RESOURCE and the output in UNORDERED_ACCESS, so Record transitions them
+/// Intel's XeSS super resolution (libxess.dll, XeSS SDK 3.x) through its D3D12 API. It runs on any GPU with DP4a.
+/// XeSS expects the inputs in NON_PIXEL_SHADER_RESOURCE and the output in UNORDERED_ACCESS, so Record transitions them.
 /// </summary>
 public unsafe class XessBackend: IBackend
 {
@@ -83,7 +83,7 @@ public unsafe class XessBackend: IBackend
 
 	private delegate void LogDelegate(byte* message, int level);
 
-	// Kept alive here, the DLL calls it from any context
+	// This field keeps the delegate alive. The DLL calls it from any context.
 	private static readonly LogDelegate LogCallback = OnLog;
 
 	private static delegate* unmanaged<ID3D12Device*, nint*, int> createContext;
@@ -97,7 +97,10 @@ public unsafe class XessBackend: IBackend
 
 	private nint context;
 
-	/// <summary>responsiveMask: every dispatch then has a reactive texture, XeSS requires it once initialized with it</summary>
+	/// <summary>
+	/// responsiveMask: every dispatch then has a reactive texture.
+	/// XeSS requires that texture once the context is initialized with the flag.
+	/// </summary>
 	public XessBackend(ID3D12Device* device, uint maxRenderWidth, uint upscaleWidth, uint upscaleHeight, bool responsiveMask)
 	{
 		LoadLibrary();

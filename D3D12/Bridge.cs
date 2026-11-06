@@ -22,20 +22,27 @@ using static TerraFX.Interop.Windows.Windows;
 
 namespace UpscaleBuddy.D3D12;
 
-/// <summary>A D3D11 texture opened on D3D12: our own twin, or the game's texture itself when it's shared</summary>
+/// <summary>
+/// A D3D11 texture opened on D3D12. It is our own twin, or the game's texture itself when that texture is shared.
+/// </summary>
 public sealed unsafe class Twin(ID3D11Texture2D* texture11, Input input)
 {
 	public readonly ID3D11Texture2D* Texture11 = texture11;
 	public readonly Input Input = input;
 }
 
-/// <summary>Records D3D12 work into the open command list; every texture arrives in COMMON state and has to be left in it</summary>
+/// <summary>
+/// Records D3D12 work into the open command list.
+/// Every texture arrives in COMMON state, and the delegate must leave it in that state.
+/// </summary>
 public unsafe delegate void RecordDelegate(ID3D12GraphicsCommandList* list);
 
 /// <summary>
-/// A D3D12 device next to the game's D3D11 one, for the D3D12 libraries (upscalers, frame generation)
-/// Game textures the game created NT shared (Game/SharedTargets) are opened directly, others are copied into shared twins,
-/// depth through a shader into R32_FLOAT since the libraries take no 24 bit depth; a shared fence orders both queues
+/// A D3D12 device next to the game's D3D11 device, for the D3D12 libraries (upscalers, frame generation).
+/// The bridge opens game textures directly when the game created them NT shared (Game/SharedTargets).
+/// It copies other textures into shared twins.
+/// It copies depth through a shader into R32_FLOAT, because the libraries take no 24 bit depth.
+/// A shared fence orders both queues.
 /// </summary>
 public unsafe class Bridge: IDisposable
 {
@@ -70,8 +77,9 @@ public unsafe class Bridge: IDisposable
 	private ID3D11UnorderedAccessView* depthUav;
 	private ID3D11Texture2D* depthUavTexture;
 
-	// Game textures by pointer, null when not shareable, each holding a reference so the address can't be reused by a
-	// reallocation while cached; unused entries are released
+	// Game textures by pointer, null when not shareable.
+	// Each entry holds a reference, so a reallocation can't reuse the address while the entry is cached.
+	// The bridge releases unused entries.
 	private readonly Dictionary<nint, Twin?> direct = [];
 	private readonly Dictionary<nint, int> directSeen = [];
 	private int executeCount;
@@ -133,7 +141,7 @@ public unsafe class Bridge: IDisposable
 			ThrowIfFailed(this.device12->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST,
 				null, __uuidof<ID3D12Resource>(), (void**)&createdReadback));
 			this.readback = createdReadback;
-			void* mapped; // Persistent, fine for readback heaps
+			void* mapped; // A persistent map is fine for readback heaps
 			ThrowIfFailed(this.readback->Map(0, null, &mapped));
 			this.timestamps = (ulong*)mapped;
 			ulong frequency;
@@ -158,8 +166,9 @@ public unsafe class Bridge: IDisposable
 	public double CpuStallMs { get; private set; }
 
 	/// <summary>
-	/// Hands the D3D11 work so far to D3D12, runs what record records, and has D3D11 wait for it. A failing record still
-	/// completes the fence handoff, D3D11 waits on it; the exception is rethrown after
+	/// Hands the D3D11 work so far to D3D12, runs what record records, and makes D3D11 wait for it.
+	/// When record fails, Execute still completes the fence handoff, and D3D11 waits on it.
+	/// Execute then rethrows the exception.
 	/// </summary>
 	public void Execute(ID3D11DeviceContext* context, RecordDelegate record, bool measure)
 	{
@@ -256,7 +265,7 @@ public unsafe class Bridge: IDisposable
 		return twin;
 	}
 
-	/// <summary>Drops game textures not seen lately, the D3D12 queue is long done with them</summary>
+	/// <summary>Drops game textures not seen lately. The D3D12 queue is long done with them.</summary>
 	private void PruneDirect()
 	{
 		List<nint> stale = [];
@@ -319,7 +328,7 @@ public unsafe class Bridge: IDisposable
 		return resource;
 	}
 
-	/// <summary>Top left of the source, as much as both textures hold</summary>
+	/// <summary>Copies the top left of the source, as much as both textures hold.</summary>
 	public static void Copy(ID3D11DeviceContext* context, ID3D11Texture2D* destination, ID3D11Texture2D* source, in Input twin)
 	{
 		D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(source);
@@ -327,7 +336,7 @@ public unsafe class Bridge: IDisposable
 		context->CopySubresourceRegion((ID3D11Resource*)destination, 0, 0, 0, 0, (ID3D11Resource*)source, 0, &box);
 	}
 
-	/// <summary>Game depth (24 bit) into an R32_FLOAT twin, the top left width x height</summary>
+	/// <summary>Copies the top left width x height of the game depth (24 bit) into an R32_FLOAT twin.</summary>
 	public void CopyDepth(ID3D11DeviceContext* context, ID3D11Texture2D* source, Twin depth, uint width, uint height)
 	{
 		// The view keeps the texture alive, so a new depth texture can't get this address
@@ -359,7 +368,9 @@ public unsafe class Bridge: IDisposable
 		context->CSSetShader(null, null, 0);
 	}
 
-	/// <summary>Waits for the queue; callers dispose their library contexts and twins first or after, the queue is idle</summary>
+	/// <summary>
+	/// Waits until the queue is idle. Callers dispose their library contexts and twins after this call.
+	/// </summary>
 	public void WaitIdle()
 	{
 		if (this.queue != null && this.fence12 != null)

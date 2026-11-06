@@ -12,7 +12,7 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 	FrameGenerationRunner frameGeneration, ClipboardGuard clipboardGuard, EffectMask effectMask, ReShadeEffects reShade)
 	: Window("UpscaleBuddy", ImGuiWindowFlags.AlwaysAutoResize)
 {
-	// Saved as the enum value, the list order is independent
+	// The configuration saves the enum value. The list order is independent of it.
 	private static readonly UpscaleMode[] Modes =
 	[
 		UpscaleMode.Off, UpscaleMode.NativeAa, UpscaleMode.Quality, UpscaleMode.Balanced, UpscaleMode.Performance,
@@ -58,7 +58,7 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			configuration.Save();
 		}
 
-		// XeSS has no sharpening pass, and the game's own DLSS keeps its own settings
+		// XeSS has no sharpening pass. The game's own DLSS keeps its own settings.
 		bool nvidia = configuration.Upscaler == Upscaler.NvidiaDlss;
 		if (nvidia)
 			ImGui.TextDisabled("DLSS/DLAA: quality and DLAA are picked in the game's graphics settings, Mode only turns this on or off.");
@@ -87,7 +87,8 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			configuration.Save();
 
 #if DEBUG
-		// A/B for whether shared targets cost the game's passes more than the copies, see UpscaleBuddyConfiguration.ZeroCopy
+		// An A/B test. It checks whether shared targets cost the game's passes more than the copies.
+		// See UpscaleBuddyConfiguration.ZeroCopy.
 		ImGui.BeginDisabled(configuration.Upscaler == Upscaler.BuiltInFsr3);
 		if (ImGui.Checkbox("Zero copy (shared render targets)", ref configuration.ZeroCopy))
 			configuration.Save();
@@ -158,7 +159,7 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		int refresh = framePacer.RefreshRate;
 		if (refresh >= 60)
 		{
-			// 0 stored = the refresh rate, so a different display keeps "refresh rate"
+			// A stored 0 means the refresh rate. Thus a different display keeps "refresh rate".
 			int target = configuration.FrameGenerationTarget is > 0 and var set && set < refresh ? set : refresh;
 			if (ImGui.SliderInt("Target", ref target, 60, refresh, target == refresh ? "%d fps (refresh rate)" : "%d fps"))
 			{

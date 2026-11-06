@@ -41,6 +41,7 @@ public unsafe class FramePacer: IDisposable
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly UiLayer uiLayer;
 	private readonly FrameGenerationRunner frameGeneration;
+	private readonly ReShadeEffects reShade;
 	private readonly Hook<Framework.Delegates.Tick>? tickHook;
 	private readonly Hook<PresentDelegate>? presentHook;
 
@@ -68,11 +69,13 @@ public unsafe class FramePacer: IDisposable
 	private int lateIndex;
 	private int lateCount;
 
-	public FramePacer(UpscaleBuddyConfiguration configuration, UiLayer uiLayer, FrameGenerationRunner frameGeneration)
+	public FramePacer(UpscaleBuddyConfiguration configuration, UiLayer uiLayer, FrameGenerationRunner frameGeneration,
+		ReShadeEffects reShade)
 	{
 		this.configuration = configuration;
 		this.uiLayer = uiLayer;
 		this.frameGeneration = frameGeneration;
+		this.reShade = reShade;
 		try
 		{
 			this.tickHook = Service.GameInteropProvider.HookFromAddress<Framework.Delegates.Tick>(
@@ -152,6 +155,7 @@ public unsafe class FramePacer: IDisposable
 		bool generate = generated != 0;
 		if (!generate && swapChain == device->SwapChain)
 			this.uiLayer.DiscardRegenerated();
+		bool effects = swapChain == device->SwapChain && this.reShade.TakeRendered();
 
 		int rate = generate ? generated : this.LimitedRate(device);
 		if (swapChain != device->SwapChain || rate == 0)
@@ -191,7 +195,7 @@ public unsafe class FramePacer: IDisposable
 		if (generate)
 		{
 			device->FrameRateLimitPresetPresent = 1;
-			(long first, long second) = this.PresentTwice(device, swapChain, period);
+			(long first, long second) = this.PresentTwice(device, swapChain, period, effects);
 			this.halves[this.halfIndex] = Math.Max(first, frameWork + second);
 			this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
 		}
@@ -275,10 +279,11 @@ public unsafe class FramePacer: IDisposable
 	/// <summary>
 	/// The generated frame (halfway from the previous frame to this one) first, this frame half a frame later; the frame
 	/// again when nothing was generated. Queued back to back, the blt swapchain doesn't hold the second for the next vblank
-	/// and the compositor only shows the newer one, so the second Present is timed
+	/// and the compositor only shows the newer one, so the second Present is timed. effects: the frame already
+	/// contains ReShade's effects. Neither Present runs ReShade's pass
 	/// </summary>
 	/// <returns>How long each Present call took, ours and whatever else runs inside it</returns>
-	private (long First, long Second) PresentTwice(Device* device, SwapChain* swapChain, long period)
+	private (long First, long Second) PresentTwice(Device* device, SwapChain* swapChain, long period, bool effects)
 	{
 		ID3D11DeviceContext* context = (ID3D11DeviceContext*)device->D3D11DeviceContext;
 		ID3D11Texture2D* backBuffer = (ID3D11Texture2D*)swapChain->BackBuffer->D3D11Texture2D;
@@ -292,6 +297,8 @@ public unsafe class FramePacer: IDisposable
 
 		context->CopyResource((ID3D11Resource*)backBuffer, (ID3D11Resource*)this.held);
 		Wait(this.deadline + period / 2);
+		if (effects)
+			this.reShade.SkipNextPresent();
 		start = Stopwatch.GetTimestamp();
 		this.presentHook!.Original(swapChain);
 		return (first, Stopwatch.GetTimestamp() - start);

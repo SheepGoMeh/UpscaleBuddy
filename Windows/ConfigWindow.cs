@@ -9,7 +9,7 @@ using UpscaleBuddy.Game;
 namespace UpscaleBuddy.Windows;
 
 public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlssPath, FramePacer framePacer, UiLayer uiLayer,
-	FrameGenerationRunner frameGeneration, ClipboardGuard clipboardGuard, EffectMask effectMask)
+	FrameGenerationRunner frameGeneration, ClipboardGuard clipboardGuard, EffectMask effectMask, ReShadeEffects reShade)
 	: Window("UpscaleBuddy", ImGuiWindowFlags.AlwaysAutoResize)
 {
 	// Saved as the enum value, the list order is independent
@@ -117,6 +117,21 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		}
 
 		ImGui.EndDisabled();
+
+		if (reShade.Available)
+		{
+			ImGui.BeginDisabled(!uiLayer.Available);
+			if (ImGui.Checkbox("ReShade under the UI", ref configuration.ReShadeBeforeUi))
+				configuration.Save();
+			if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+			{
+				ImGui.SetTooltip(
+					"Applies ReShade's effects to the game world before the UI is drawn, so the UI and nameplates stay\n" +
+					"untouched. With frame generation, the effects run once per rendered frame instead of on every shown one.");
+			}
+
+			ImGui.EndDisabled();
+		}
 
 		ImGui.BeginDisabled(!framePacer.Available);
 		if (ImGui.Checkbox("Low latency frame limiter", ref configuration.LowLatencyLimiter))

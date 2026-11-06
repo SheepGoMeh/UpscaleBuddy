@@ -22,7 +22,7 @@ namespace UpscaleBuddy.Game;
 
 /// <summary>
 /// Splits each frame into the scene and the UI, the inputs frame generation needs, and finishes extra frames the way the
-/// game finishes its own.
+/// game finishes its own. It also splits the frame without frame generation when ReShade's effects go under the UI.
 /// - AtkServer.Draw (from RaptureAtkModule.Draw2D): binds RTM+0x570, the final target, and builds the UI's commands.
 ///   Here RTM+0x570 is our layer for the call and restored after.
 /// - SetBlendState (render thread): while the layer is render target 0 the packed blend key gets alpha factors that
@@ -42,9 +42,19 @@ public unsafe class UiLayer: IDisposable
 	private const int ToneAdjustChainOffset = 0x1B0;
 	private const int ChainInputOffset = 0x18; // PostEffectChain, Kernel::Texture*
 	private const int PartOutputOffset = 0x38; // PostEffectPart, render target 0
-	private const string SetChainInputSignature = "40 56 41 55 48 83 EC 28 48 8B 41 18"; // sub_140349BB0(chain, texture)
-	private const string SetChainOutputSignature = "40 57 48 83 EC 20 44 8B 41 10"; // sub_140349CB0(chain, texture), last part
-	private const string RenderChainSignature = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 65 48 8B 04 25 ?? ?? ?? ?? 48 8B F9";
+	private const string SetChainInputSignature = "40 56 41 55 48 83 EC ?? 48 8B 41"; // sub_140349E00(chain, texture)
+	private const string SetChainOutputSignature = "40 57 48 83 EC ?? 44 8B 41"; // sub_140349F00(chain, texture), last part
+	private const string RenderChainSignature = "E8 ?? ?? ?? ?? 41 8B 46 ?? 8B DF"; // PostEffectChain.Render, from sub_140362540
+
+	// With ToneAdjust off, Manager.Render (sub_140362D70) runs the ToneAdjust chain on the back buffer after the UI.
+	// It runs the chain when PostEffectManager+0x4410 is -1 and one of these conditions is true:
+	// - Device+0x98 (gamma) is not 1.
+	// - Device+0x9C (color filter) is set and Device+0xA0 is more than 0.
+	// The scene copies do not contain this pass.
+	private const int ToneAdjustHandleOffset = 0x4410;
+	private const int GammaOffset = 0x98;
+	private const int ToneFlagOffset = 0x9C;
+	private const int ToneAmountOffset = 0xA0;
 
 	// RenderTargetManager.Initialize's targets: TextureRenderTarget | ReadWrite | UserManaged, allocation class 3
 	private const TextureFlags TargetFlags = TextureFlags.TextureRenderTarget | TextureFlags.ReadWrite | TextureFlags.UserManaged;
@@ -69,6 +79,7 @@ public unsafe class UiLayer: IDisposable
 
 	private readonly UpscaleBuddyConfiguration configuration;
 	private readonly FrameGenerationRunner runner;
+	private readonly ReShadeEffects reShade;
 	private readonly Hook<AtkServer.Delegates.Draw>? drawHook;
 	private readonly Hook<SetBlendStateDelegate>? setBlendStateHook;
 	private readonly Hook<SetTargetDelegate>? setTargetHook;
@@ -106,11 +117,14 @@ public unsafe class UiLayer: IDisposable
 	private ID3D11VertexShader* vertexShader;
 	private ID3D11PixelShader* pixelShader;
 	private ID3D11BlendState* blendState;
+	private ID3D11Texture2D* readable;
+	private ID3D11ShaderResourceView* readableView;
 
-	public UiLayer(UpscaleBuddyConfiguration configuration, FrameGenerationRunner runner)
+	public UiLayer(UpscaleBuddyConfiguration configuration, FrameGenerationRunner runner, ReShadeEffects reShade)
 	{
 		this.configuration = configuration;
 		this.runner = runner;
+		this.reShade = reShade;
 		this.compositeCallback = this.Composite;
 		this.regenerateCallback = this.Regenerate;
 		this.compositeFunction = Marshal.GetFunctionPointerForDelegate(this.compositeCallback);
@@ -163,17 +177,23 @@ public unsafe class UiLayer: IDisposable
 		KernelTexture** final = (KernelTexture**)((byte*)RenderTargetManager.Instance() + FinalTargetOffset);
 		KernelTexture* target = *final;
 		KernelTexture* ui = null;
-		if (this.runner.Enabled && !this.stopped && target != null)
+		bool generate = this.runner.Enabled;
+		bool effects = this.reShade.Active;
+		if ((generate || effects) && !this.stopped && target != null)
 		{
 			KernelTexture* current = this.Layer;
 			ui = this.Fit(ref current, target->ActualWidth, target->ActualHeight);
 			this.layer = (nint)current;
 		}
 
-		if (ui == null)
+		if (ui == null || !generate)
 		{
 			this.runner.Skip();
 			this.regenerated = null;
+		}
+
+		if (ui == null)
+		{
 			this.finalTarget = 0;
 			this.drawHook!.Original(atkServer, flag);
 			return;
@@ -184,7 +204,7 @@ public unsafe class UiLayer: IDisposable
 		this.drawHook!.Original(atkServer, flag);
 		*final = target;
 
-		this.QueueFrame(target, ui);
+		this.QueueFrame(target, ui, generate, effects);
 	}
 
 	/// <summary>
@@ -212,14 +232,21 @@ public unsafe class UiLayer: IDisposable
 
 	private (uint, uint) failedSize;
 
-	/// <summary>Main thread: the frame's callbacks in view 31 around ToneAdjust, and the regenerated frame's ToneAdjust</summary>
-	private void QueueFrame(KernelTexture* target, KernelTexture* ui)
+	/// <summary>
+	/// Main thread. Queues the frame's callbacks in view 31 around ToneAdjust. With frame generation, it also queues ToneAdjust
+	/// for the regenerated frame. effects: the composite callback applies ReShade's effects
+	/// </summary>
+	private void QueueFrame(KernelTexture* target, KernelTexture* ui, bool generate, bool effects)
 	{
-		this.sceneIndex ^= 1;
-		KernelTexture* scene = this.Fit(ref this.scenes[this.sceneIndex], target->ActualWidth, target->ActualHeight);
+		KernelTexture* scene = null;
+		if (generate)
+		{
+			this.sceneIndex ^= 1;
+			scene = this.Fit(ref this.scenes[this.sceneIndex], target->ActualWidth, target->ActualHeight);
+		}
 
 		PostEffectManager* postEffects = PostEffectManager.Instance();
-		bool toneAdjust = (postEffects->Flags & PostEffectFlags.ToneAdjust) != 0;
+		bool toneAdjust = (postEffects->Flags & PostEffectFlags.ToneAdjust) != 0 || InPlace(postEffects);
 		KernelTexture* backBuffer = Device.Instance()->SwapChain->BackBuffer;
 		KernelTexture* source = null;
 		KernelTexture* finished = null;
@@ -237,12 +264,14 @@ public unsafe class UiLayer: IDisposable
 		uint top = (*((byte*)context + ContextSubViewFlagOffset) == 0 ? sortKey | 0xF0000000 : sortKey) & 0xF0000000;
 		context->ViewIndex = ToneAdjustView;
 
+		// The composite callback does not use SetDefaultState. SetDefaultState records the back buffer as bound but does not
+		// bind it, so ToneAdjust then skips its bind of the back buffer. ReShade restores the state that it changes
 		context->SortKey = top | BeforeToneAdjust;
-		this.QueueCallback(context, this.compositeFunction, false, (nint)target, (nint)ui, (nint)scene);
+		this.QueueCallback(context, this.compositeFunction, false, (nint)target, (nint)ui, (nint)scene, effects ? 1 : 0);
 
 		// Frame generation libraries change state freely: the game resets its state cache around it, like for DLSS
 		context->SortKey = top | AfterToneAdjust;
-		this.QueueCallback(context, this.regenerateFunction, true, (nint)ui, (nint)scene, (nint)source);
+		this.QueueCallback(context, this.regenerateFunction, generate, (nint)ui, (nint)scene, (nint)source, 0);
 		if (source != null && toneAdjust && finished != null)
 			this.QueueToneAdjust(postEffects, source, finished);
 
@@ -251,9 +280,9 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>defaultState: ImmediateContextDX11.SetDefaultState before and after, for callbacks that change state directly</summary>
-	private void QueueCallback(Context* context, nint function, bool defaultState, nint first, nint second, nint third)
+	private void QueueCallback(Context* context, nint function, bool defaultState, nint first, nint second, nint third, nint fourth)
 	{
-		byte* command = (byte*)context->AllocateCommand((ulong)(CallbackSize + 3 * sizeof(nint)));
+		byte* command = (byte*)context->AllocateCommand((ulong)(CallbackSize + 4 * sizeof(nint)));
 		if (command == null)
 			return;
 
@@ -261,6 +290,7 @@ public unsafe class UiLayer: IDisposable
 		arguments[0] = first;
 		arguments[1] = second;
 		arguments[2] = third;
+		arguments[3] = fourth;
 		*(uint*)command = CallbackCommandType;
 		*(nint*)(command + 0x8) = function;
 		*(nint*)(command + 0x10) = (nint)arguments;
@@ -279,12 +309,25 @@ public unsafe class UiLayer: IDisposable
 		if (last == null)
 			return;
 
+		// cToneMapParam contains the values for this frame. Manager.Render or Submit sets them before the UI pass
 		KernelTexture* output = *(KernelTexture**)(last + PartOutputOffset);
+		chain->Scale = 1;
 		this.setChainInput(chain, source);
 		this.setChainOutput(chain, target);
 		this.renderChain(chain);
 		this.setChainInput(chain, input);
 		this.setChainOutput(chain, output);
+	}
+
+	/// <summary>Returns true when Manager.Render runs the ToneAdjust chain on the back buffer (the same test)</summary>
+	private static bool InPlace(PostEffectManager* postEffects)
+	{
+		byte* device = (byte*)Device.Instance();
+		if (device == null || *(long*)((byte*)postEffects + ToneAdjustHandleOffset) != -1)
+			return false;
+
+		float gamma = *(float*)(device + GammaOffset);
+		return gamma != 1 || (*(int*)(device + ToneFlagOffset) != 0 && *(float*)(device + ToneAmountOffset) > 0);
 	}
 
 	/// <summary>
@@ -348,7 +391,10 @@ public unsafe class UiLayer: IDisposable
 		return *(uint*)&desc;
 	}
 
-	/// <summary>Render thread, after the UI and before ToneAdjust: scene saved, layer onto the final target</summary>
+	/// <summary>
+	/// Render thread, between the UI and ToneAdjust. Applies ReShade's effects to the scene, saves the scene and draws the
+	/// layer on the final target
+	/// </summary>
 	private void Composite(nint* arguments)
 	{
 		this.composited = false;
@@ -361,6 +407,8 @@ public unsafe class UiLayer: IDisposable
 		bool drawn = this.drawn == (nint)ui;
 		this.drawn = 0;
 		ID3D11DeviceContext* context = (ID3D11DeviceContext*)Device.Instance()->D3D11DeviceContext;
+		if (arguments[3] != 0)
+			this.reShade.Render(target);
 		if (scene != null)
 			this.Copy(context, scene, target);
 
@@ -415,22 +463,65 @@ public unsafe class UiLayer: IDisposable
 	private static ID3D11RenderTargetView* RenderTarget(KernelTexture* texture) =>
 		(ID3D11RenderTargetView*)texture->GetMipRenderTarget(0)->D3D11RenderTargetViewOrDepthStencilView;
 
-	/// <summary>CopyResource when the D3D11 formats match, a blit when they don't (the back buffer is R8G8B8A8, ours B8G8R8A8)</summary>
+	/// <summary>
+	/// Uses CopyResource when the D3D11 formats are the same, and a blit when they are different. The back buffer is R8G8B8A8
+	/// and our textures are B8G8R8A8. For a source without a shader view (the back buffer), the blit reads a copy in its own
+	/// format
+	/// </summary>
 	private void Copy(ID3D11DeviceContext* context, KernelTexture* target, KernelTexture* source)
 	{
 		ID3D11Texture2D* to = (ID3D11Texture2D*)target->D3D11Texture2D;
 		ID3D11Texture2D* from = (ID3D11Texture2D*)source->D3D11Texture2D;
 		if (Dx.GetDesc(to).Format == Dx.GetDesc(from).Format)
+		{
 			context->CopyResource((ID3D11Resource*)to, (ID3D11Resource*)from);
-		else
-			this.Draw(context, target, source, false);
+			return;
+		}
+
+		ID3D11ShaderResourceView* view = (ID3D11ShaderResourceView*)source->D3D11ShaderResourceView;
+		this.Draw(context, target, view != null ? view : this.ReadableCopy(context, from), false);
+	}
+
+	/// <summary>
+	/// Copies the texture into a texture with a shader view and returns that view. Recreates the copy when the size or format
+	/// changes
+	/// </summary>
+	private ID3D11ShaderResourceView* ReadableCopy(ID3D11DeviceContext* context, ID3D11Texture2D* texture)
+	{
+		D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(texture);
+		D3D11_TEXTURE2D_DESC current = this.readable != null ? Dx.GetDesc(this.readable) : default;
+		if (current.Width != desc.Width || current.Height != desc.Height || current.Format != desc.Format)
+		{
+			Dx.Release(this.readableView);
+			Dx.Release(this.readable);
+			this.readableView = null;
+			this.readable = null;
+
+			ID3D11Device* device;
+			context->GetDevice(&device);
+			try
+			{
+				this.readable = Dx.CreateTexture(device, desc.Width, desc.Height, desc.Format, 1, (uint)D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE);
+				this.readableView = Dx.CreateSrv(device, this.readable);
+			}
+			finally
+			{
+				device->Release();
+			}
+		}
+
+		context->CopyResource((ID3D11Resource*)this.readable, (ID3D11Resource*)texture);
+		return this.readableView;
 	}
 
 	/// <summary>
 	/// Source over the target, premultiplied alpha blended or copied, in a context state of its own: the game's bindings and
 	/// its state cache stay as they were
 	/// </summary>
-	private void Draw(ID3D11DeviceContext* context, KernelTexture* target, KernelTexture* ui, bool blend)
+	private void Draw(ID3D11DeviceContext* context, KernelTexture* target, KernelTexture* ui, bool blend) =>
+		this.Draw(context, target, (ID3D11ShaderResourceView*)ui->D3D11ShaderResourceView, blend);
+
+	private void Draw(ID3D11DeviceContext* context, KernelTexture* target, ID3D11ShaderResourceView* layerView, bool blend)
 	{
 		if (this.state == null)
 			this.CreateResources(context);
@@ -439,7 +530,6 @@ public unsafe class UiLayer: IDisposable
 		this.context1->SwapDeviceContextState(this.state, &previous);
 
 		ID3D11RenderTargetView* view = RenderTarget(target);
-		ID3D11ShaderResourceView* layerView = (ID3D11ShaderResourceView*)ui->D3D11ShaderResourceView;
 		D3D11_VIEWPORT viewport = new() { Width = target->ActualWidth, Height = target->ActualHeight, MaxDepth = 1 };
 		context->OMSetRenderTargets(1, &view, null);
 		context->OMSetBlendState(blend ? this.blendState : null, null, uint.MaxValue);
@@ -517,6 +607,8 @@ public unsafe class UiLayer: IDisposable
 		Release(ref this.regeneratedTarget);
 		Release(ref this.regeneratedSource);
 
+		Dx.Release(this.readableView);
+		Dx.Release(this.readable);
 		Dx.Release(this.blendState);
 		Dx.Release(this.pixelShader);
 		Dx.Release(this.vertexShader);

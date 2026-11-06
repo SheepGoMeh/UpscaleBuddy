@@ -43,11 +43,11 @@ public unsafe class DlssPath: IDisposable
 	// (FUN_1402dac20) from its result, clamped to the display height
 	private const string RenderSizeSignature = "E8 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? B9";
 
-	// From PostEffectManager setup (FUN_1403528a0), only done on DLSS capable GPUs
-	// MemAlloc(0x188), ctor, PostEffectManager+0x4220, RenderTargetManager+0x730 = render size callback
-	private const string MemAllocSignature = "E8 ?? ?? ?? ?? 48 8B F8 41 BE";
+	// PostEffectManager setup (FUN_1403528a0) runs only on DLSS capable GPUs. It calls MemAlloc(0x188) and the ctor, stores
+	// the object at PostEffectManager+0x4220 and sets RenderTargetManager+0x730 to the render size callback
+	private const string MemAllocSignature = "E8 ?? ?? ?? ?? 48 8B D8 41 B8";
 	private const string DlssObjectCtorSignature = "E8 ?? ?? ?? ?? EB ?? 49 8B C7 48 89 87 ?? ?? ?? ?? 48 8D 0D";
-	private const string RenderSizeCallbackSignature = "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B 05 ?? ?? ?? ?? 49 8B F9"; // FUN_140352100
+	private const string RenderSizeCallbackSignature = "48 89 5C 24 ?? 48 89 74 24 ?? 48 89 7C 24 ?? 41 56 48 83 EC ?? 48 8B 05 ?? ?? ?? ?? 49 8B F9"; // FUN_140352350
 	private const int DlssObjectSize = 0x188;
 	private const int DlssObjectOffset = 0x4220;
 	private const int RenderSizeCallbackOffset = 0x730;

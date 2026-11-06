@@ -21,10 +21,10 @@ namespace UpscaleBuddy.Game;
 public unsafe class SharedTargets: IDisposable
 {
 	// Kernel::Texture: releases the D3D11 resource, views and source
-	private const string ReleaseResourcesSignature = "40 53 41 54 48 83 EC 28 48 8B 91 B8 00 00 00";
+	private const string ReleaseResourcesSignature = "40 53 41 54 48 83 EC ?? 48 8B 91";
 
 	// Kernel::Texture: sets the size (and mips, and format unless 0), then creates the D3D11 resource and views; on failure releases
-	private const string ResizeSignature = "40 53 48 83 EC 20 48 8B 02 48 8B D9 48 89 41 38 48 8B 02";
+	private const string ResizeSignature = "E8 ?? ?? ?? ?? 84 C0 75 ?? EB ?? 8B 47";
 
 	private const int SourceTextureOffset = 0xC0; // Kernel::Texture*, the texture whose D3D11 resource this one aliases
 

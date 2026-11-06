@@ -30,9 +30,9 @@ namespace UpscaleBuddy.Game;
 /// </summary>
 public unsafe class EffectMask: IDisposable
 {
-	private const string WeatherRenderSignature = "40 57 48 83 EC 60 C6 81 ?? ?? ?? ?? ??";
-	private const string WeatherFinishSignature = "40 53 48 83 EC 40 80 3D ?? ?? ?? ?? ??";
-	private const string EffectsMaskEnabledSignature = "E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 4C 8B 35 ?? ?? ?? ??"; // From Manager.Render
+	private const string WeatherRenderSignature = "40 57 48 83 EC ?? C6 81 ?? ?? ?? ?? ?? 48 8B F9";
+	private const string WeatherFinishSignature = "E8 ?? ?? ?? ?? 48 8D BB ?? ?? ?? ?? 4C 39 6F"; // From Manager.RenderView
+	private const string EffectsMaskEnabledSignature = "E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 4C 8B 35"; // From Manager.Render
 
 	private const int GameMaskOffset = 0x680; // RenderTargetManager: DepthOfFieldEffectMask, B8G8R8A8 at the render size
 

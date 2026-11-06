@@ -146,7 +146,7 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 			this.context = CreateContext(&create.Header, "ffxCreateContext (frame generation)");
 
 			string? provider = ProviderName(this.context);
-			this.Name = provider != null ? $"FSR {provider} frame generation (AMD DLL, D3D12)" : "FSR frame generation (AMD DLL, D3D12)";
+			this.Name = provider != null ? $"FSR {provider} frame generation (AMD)" : "FSR frame generation (AMD)";
 		}
 		catch
 		{
@@ -155,7 +155,7 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 		}
 	}
 
-	public string Name { get; } = "FSR frame generation (AMD DLL, D3D12)";
+	public string Name { get; } = "FSR frame generation (AMD)";
 
 	public void Generate(ID3D11DeviceContext* d3d11, in FrameInputs inputs, ID3D11Texture2D* result)
 	{

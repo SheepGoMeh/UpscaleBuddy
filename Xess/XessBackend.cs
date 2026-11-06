@@ -123,7 +123,7 @@ public unsafe class XessBackend: IBackend
 			Check(init(created, &parameters), "xessD3D12Init");
 
 			Version version;
-			this.Name = getVersion(&version) >= 0 ? $"XeSS {version.Major}.{version.Minor}.{version.Patch} (Intel DLL, D3D12)" : "XeSS (Intel DLL, D3D12)";
+			this.Name = getVersion(&version) >= 0 ? $"XeSS {version.Major}.{version.Minor}.{version.Patch} (Intel)" : "XeSS (Intel)";
 		}
 		catch
 		{

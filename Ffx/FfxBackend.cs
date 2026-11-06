@@ -84,7 +84,7 @@ public unsafe class FfxBackend: IBackend
 		this.context = CreateContext(&create.Header, "ffxCreateContext");
 
 		string? provider = ProviderName(this.context);
-		this.Name = provider != null ? $"FSR {provider} (AMD DLL, D3D12)" : "FSR (AMD DLL, D3D12)";
+		this.Name = provider != null ? $"FSR {provider} (AMD)" : "FSR (AMD)";
 	}
 
 	public string Name { get; }

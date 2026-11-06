@@ -22,16 +22,16 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 
 	private static readonly string[] ModeNames =
 	[
-		"Off (game's own upscaler)", "Native AA (1.0x)", "Quality (1.5x)", "Balanced (1.7x)", "Performance (2.0x)",
-		"Ultra Performance (3.0x)", "Supersample 1.25x (experimental)", "Supersample 1.5x (experimental)",
-		"Supersample 1.75x (experimental)", "Supersample 2.0x (experimental)",
+		"Off (the game's own upscaler)", "Native AA (100% resolution)", "Quality (67% resolution)", "Balanced (59% resolution)",
+		"Performance (50% resolution)", "Ultra Performance (33% resolution)", "Supersample 125% (experimental)",
+		"Supersample 150% (experimental)", "Supersample 175% (experimental)", "Supersample 200% (experimental)",
 	];
 
 	private static readonly Upscaler[] Upscalers = [Upscaler.BuiltInFsr3, Upscaler.AmdFsr, Upscaler.IntelXess];
 
 	private static readonly string[] UpscalerNames =
 	[
-		"FSR 3.1 (built-in, D3D11)", "AMD FSR (DLL over D3D12, FSR 4 where supported)", "Intel XeSS (DLL over D3D12)",
+		"FSR 3.1 (built in, any GPU)", "AMD FSR (FSR 4 on supported AMD GPUs)", "Intel XeSS",
 	];
 
 	// Only on an NVIDIA GPU the game finds DLSS capable
@@ -61,9 +61,9 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		// XeSS has no sharpening pass. The game's own DLSS keeps its own settings.
 		bool nvidia = configuration.Upscaler == Upscaler.NvidiaDlss;
 		if (nvidia)
-			ImGui.TextDisabled("DLSS/DLAA: quality and DLAA are picked in the game's graphics settings, Mode only turns this on or off.");
+			ImGui.TextDisabled("The game's graphics settings choose the DLSS quality and DLAA. Mode only turns DLSS on or off.");
 		ImGui.BeginDisabled(configuration.Upscaler == Upscaler.IntelXess || nvidia);
-		if (ImGui.Checkbox("Sharpening (RCAS, FSR only)", ref configuration.Sharpening))
+		if (ImGui.Checkbox("Sharpening (FSR only)", ref configuration.Sharpening))
 			configuration.Save();
 
 		ImGui.BeginDisabled(!configuration.Sharpening);
@@ -73,14 +73,15 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		ImGui.EndDisabled();
 
 		ImGui.BeginDisabled(!effectMask.Available);
-		if (ImGui.SliderFloat("Rain and effects responsiveness", ref configuration.EffectResponsiveness, 0.0f, 10.0f, "%.1f"))
+		if (ImGui.SliderFloat("Rain and effects clarity", ref configuration.EffectResponsiveness, 0.0f, 10.0f, "%.1f"))
 			configuration.Save();
 		ImGui.EndDisabled();
 		if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
 		{
 			ImGui.SetTooltip(
-				"How strongly the upscaler keeps rain and spell effects from the current frame instead of blending them\n" +
-				"away. Works with XeSS, FSR 3.1 and DLSS; FSR 4 doesn't use it. 0 turns it off.");
+				"Keeps rain and spell effects clear. Without it, the upscaler can smear them across frames.\n" +
+				"Higher values keep more of them. 0 turns this off.\n" +
+				"FSR 3.1, XeSS and DLSS use this setting. FSR 4 ignores it.");
 		}
 
 		if (ImGui.Checkbox("Show timings", ref configuration.ShowTimings))
@@ -97,12 +98,13 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 
 		ImGui.EndDisabled();
 
-		ImGui.TextDisabled(nvidia ? "Applies while the game's 3D resolution scaling is set to NVIDIA DLSS." :
-			"Applies while the game's 3D resolution scaling is set to AMD FSR.");
+		ImGui.TextDisabled(nvidia ? "Works only while the game's upscaling setting is NVIDIA DLSS." :
+			"Works only while the game's upscaling setting is AMD FSR.");
 		ImGui.TextDisabled(dlssPath.Status);
 		if (dlssPath.Running)
 		{
-			ImGui.TextDisabled($"Rendering {dlssPath.RenderWidth}x{dlssPath.RenderHeight}, output {dlssPath.OutputWidth}x{dlssPath.OutputHeight}");
+			ImGui.TextDisabled(
+				$"The game renders at {dlssPath.RenderWidth}x{dlssPath.RenderHeight}. You see {dlssPath.OutputWidth}x{dlssPath.OutputHeight}.");
 			if (configuration.ShowTimings)
 				ImGui.TextDisabled($"Upscaler per frame: CPU {dlssPath.CpuMs:F3} ms, {dlssPath.GpuTimings}");
 		}
@@ -122,13 +124,14 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		if (reShade.Available)
 		{
 			ImGui.BeginDisabled(!uiLayer.Available);
-			if (ImGui.Checkbox("ReShade under the UI", ref configuration.ReShadeBeforeUi))
+			if (ImGui.Checkbox("ReShade effects under the UI", ref configuration.ReShadeBeforeUi))
 				configuration.Save();
 			if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
 			{
 				ImGui.SetTooltip(
-					"Applies ReShade's effects to the game world before the UI is drawn, so the UI and nameplates stay\n" +
-					"untouched. With frame generation, the effects run once per rendered frame instead of on every shown one.");
+					"ReShade changes only the game world. The UI and nameplates keep their normal look.\n" +
+					"The game's brightness setting also applies to ReShade's effects.\n" +
+					"With frame generation, ReShade runs once for each rendered frame, not for each shown frame.");
 			}
 
 			ImGui.EndDisabled();
@@ -138,7 +141,7 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		if (ImGui.Checkbox("Low latency frame limiter", ref configuration.LowLatencyLimiter))
 			configuration.Save();
 		if (ImGui.IsItemHovered())
-			ImGui.SetTooltip("Replaces the game's 60/30 fps limit: waits before input is read instead of after the frame is built.");
+			ImGui.SetTooltip("Replaces the game's 60 and 30 fps limits. Your input reaches the screen sooner at the same frame rate.");
 		ImGui.EndDisabled();
 
 		ImGui.BeginDisabled(!framePacer.Available || !uiLayer.Available);
@@ -147,9 +150,10 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		if (ImGui.IsItemHovered())
 		{
 			ImGui.SetTooltip(
-				"Generates a frame between every two rendered ones: the game renders at half the target and frames are\n" +
-				"shown at the target. The game's Frame Rate Threshold doesn't apply while this is on. Needs the upscaler\n" +
-				"above running, and pacing like the low latency frame limiter is always on.");
+				"Adds a generated frame between each pair of real frames.\n" +
+				"The game renders at half the target frame rate, and you see the full target.\n" +
+				"The game's Frame Rate Threshold setting has no effect while this is on.\n" +
+				"Needs the upscaler above to be on. Also limits the frame rate like the low latency frame limiter.");
 		}
 
 		ImGui.EndDisabled();
@@ -170,25 +174,30 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			if (ImGui.IsItemHovered())
 			{
 				ImGui.SetTooltip(
-					"Frames shown per second. The game has to render half of it, with headroom: its frame has to be built\n" +
-					"in half a rendered frame. Targets that don't divide the refresh rate need a variable refresh display.");
+					"Frames shown per second. The game must render half this number, with time to spare.\n" +
+					"A target that does not divide evenly into the refresh rate needs a variable refresh rate display\n" +
+					"(G-Sync or FreeSync).");
 			}
 		}
 
 		// Each real frame waits half a rendered frame behind the generated one, plus about 1 ms of generation
 		int rendered = framePacer.GenerationRate;
 		if (rendered > 0)
-			ImGui.TextDisabled($"Rendering {rendered} fps, showing {rendered * 2} fps, adds about {(500 / rendered) + 1} ms of latency");
+		{
+			ImGui.TextDisabled(
+				$"The game renders {rendered} fps and you see {rendered * 2} fps. Input delay increases by about {(500 / rendered) + 1} ms.");
+		}
+
 		if (!framePacer.KeepingUp)
 		{
 			int sustained = framePacer.SustainedTarget;
 			ImGui.TextColored(ImGuiColors.DalamudOrange, sustained >= 60
-				? $"Can't keep up: this scene holds about {sustained} fps, lower the target"
-				: "Can't keep up: the game is too slow here for frame generation");
+				? $"Too slow for this target. This scene holds about {sustained} fps. Lower the target."
+				: "The game is too slow here for frame generation.");
 		}
 
 		ImGui.TextDisabled(frameGeneration.Paused
-			? "Paused while the game is AFK or inactive"
+			? "Paused while you are AFK or the game window is in the background."
 			: frameGeneration.Status);
 	}
 }

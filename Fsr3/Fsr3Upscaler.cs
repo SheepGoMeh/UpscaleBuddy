@@ -255,7 +255,7 @@ public unsafe class Fsr3Upscaler: IUpscaler
 		this.constants.MinDisocclusionAccumulation = -1.0f / 3.0f;
 	}
 
-	public string Name => "FSR 3.1 (built-in)";
+	public string Name => "FSR 3.1 (built in)";
 
 	public string Timings => $"GPU {this.timer.Ms[0]:F3} ms";
 

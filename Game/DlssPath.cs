@@ -201,7 +201,7 @@ public unsafe class DlssPath: IDisposable
 		}
 		catch (Exception e)
 		{
-			this.Status = "Unavailable (signature not found)";
+			this.Status = "Not available for this game version. Wait for a plugin update.";
 			Service.PluginLog.Warning(e, "DlssPath unavailable");
 		}
 
@@ -377,7 +377,7 @@ public unsafe class DlssPath: IDisposable
 				return;
 
 			this.failedSettings = (this.configuration.Upscaler, this.configuration.Mode);
-			this.BeginRelease($"{failed}. The game's own upscaler is back on; change the upscaler or mode to try again");
+			this.BeginRelease($"{failed}. The game's own upscaler is back on. Change the upscaler or mode to try again.");
 			return;
 		}
 
@@ -392,7 +392,7 @@ public unsafe class DlssPath: IDisposable
 				this.Activate();
 				break;
 			case State.Active when !wanted:
-				this.BeginRelease(this.configuration.Mode == UpscaleMode.Off ? "Off" : "Off (the game's upscaler is not AMD FSR)");
+				this.BeginRelease(this.configuration.Mode == UpscaleMode.Off ? "Off" : "Off. Set the game's upscaling to AMD FSR to use it.");
 				break;
 			case State.Active:
 				this.KeepActive();
@@ -405,7 +405,7 @@ public unsafe class DlssPath: IDisposable
 		if (this.state == State.Idle && !wanted && !this.nativeHooked)
 		{
 			this.Status = this.configuration.Mode == UpscaleMode.Off ? "Off" :
-				native ? "Off (the game's upscaler is not NVIDIA DLSS)" : "Off (the game's upscaler is not AMD FSR)";
+				native ? "Off. Set the game's upscaling to NVIDIA DLSS to use it." : "Off. Set the game's upscaling to AMD FSR to use it.";
 		}
 	}
 
@@ -431,7 +431,7 @@ public unsafe class DlssPath: IDisposable
 		this.frameReady = false;
 		this.resetFrames = ResetFramesAfterStart;
 		this.InvalidateFeature();
-		this.Status = $"Restarting ({reason})";
+		this.Status = $"Restarting after an error ({reason})";
 		Service.PluginLog.Warning($"Restarting the upscaler ({this.restarts.Count} of {MaxRestarts}): {reason}");
 		return true;
 	}
@@ -490,7 +490,7 @@ public unsafe class DlssPath: IDisposable
 		{
 			this.configuration.Mode = UpscaleMode.Off;
 			this.configuration.Save();
-			this.BeginRelease("The game rejected the DLSS path; turned off");
+			this.BeginRelease("The game did not accept the plugin's upscaler. The plugin is off.");
 			return;
 		}
 
@@ -788,7 +788,7 @@ public unsafe class DlssPath: IDisposable
 				}
 				catch (Exception e)
 				{
-					fallback = $", {selected} failed: {e.Message}";
+					fallback = $". {(selected == Upscaler.IntelXess ? "Intel XeSS" : "AMD FSR")} did not start: {e.Message}";
 					Service.PluginLog.Error(e, $"{selected} context creation failed, using the built-in FSR 3.1");
 				}
 			}
@@ -807,7 +807,7 @@ public unsafe class DlssPath: IDisposable
 			this.OutputWidth = outputWidth;
 			this.OutputHeight = outputHeight;
 			this.Status = $"On, {created.Name}{fallback}" +
-			              ((flags & NgxFeatureFlagDepthInverted) == 0 ? " (the game reports non-inverted depth, expect artifacts)" : "");
+			              ((flags & NgxFeatureFlagDepthInverted) == 0 ? ". Expect visual errors, because the game reports an unusual depth format." : "");
 			this.loggedEvaluateError = false;
 		}
 		catch (Exception e)
@@ -888,13 +888,13 @@ public unsafe class DlssPath: IDisposable
 			D3D11_TEXTURE2D_DESC colorDesc = Dx.GetDesc(dispatch.Color);
 			if (colorDesc.Width < current.MaxRenderWidth || colorDesc.Height < current.MaxRenderHeight)
 			{
-				this.Status = $"Waiting for the render targets ({colorDesc.Width}x{colorDesc.Height} allocated)";
+				this.Status = "Waiting for the game to resize its render targets";
 				return NgxParameters.Fail;
 			}
 
 			D3D11_TEXTURE2D_DESC outputDesc = Dx.GetDesc(gameOutput);
 			dispatch.Output = currentDownsampler.Intermediate;
-			this.Status = $"On (supersampling, output texture {outputDesc.Width}x{outputDesc.Height})";
+			this.Status = $"On, supersampling to {outputDesc.Width}x{outputDesc.Height}";
 		}
 
 		try

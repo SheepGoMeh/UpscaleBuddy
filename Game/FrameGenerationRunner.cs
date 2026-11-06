@@ -60,7 +60,8 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 
 		if (!dlssPath.TakeFrame(out FrameInputs inputs) || inputs.Depth == null || inputs.MotionVectors == null)
 		{
-			this.Status = "Waiting for the upscaler (needs the game's resolution scaling on AMD FSR, or NVIDIA DLSS with the DLSS entry)";
+			this.Status =
+				"Waiting for the upscaler. Set the game's upscaling to AMD FSR, or to NVIDIA DLSS with the DLSS entry selected above.";
 			return false;
 		}
 
@@ -79,7 +80,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 		catch (Exception e)
 		{
 			this.failed = true;
-			this.Release($"Failed: {e.Message}");
+			this.Release($"Frame generation did not start: {e.Message}");
 			Service.PluginLog.Error(e, "Frame generation failed, repeating frames until it's turned off and on again");
 			return false;
 		}

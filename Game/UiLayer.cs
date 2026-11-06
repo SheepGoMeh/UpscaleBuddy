@@ -34,7 +34,7 @@ namespace UpscaleBuddy.Game;
 /// </summary>
 public unsafe class UiLayer: IDisposable
 {
-	// RenderTargetManager, Kernel::Texture* the UI is drawn on: the back buffer, or ToneAdjustSource (RTM+0x4E8) with ToneAdjust on
+	// RenderTargetManager, Kernel::Texture* the UI is drawn on: the back buffer, or ToneAdjustSource (RTM+0x370) with ToneAdjust on
 	private const int FinalTargetOffset = 0x570;
 
 	// PostEffectManager+0x1B0: ToneAdjust, input PostEffectManager+0x4028 (= ToneAdjustSource), output +0x4020 (final)

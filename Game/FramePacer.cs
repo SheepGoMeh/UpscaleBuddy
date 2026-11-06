@@ -8,6 +8,9 @@ using Dalamud.Hooking;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 
 using TerraFX.Interop.DirectX;
+using TerraFX.Interop.Windows;
+
+using static TerraFX.Interop.Windows.Windows;
 
 using Framework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
 
@@ -21,11 +24,17 @@ namespace UpscaleBuddy.Game;
 /// </summary>
 public unsafe class FramePacer: IDisposable
 {
-	// Sleep until 2 ms before, then spin
-	private static readonly long SpinTicks = Stopwatch.Frequency / 500;
+	// Wait on the timer until 1 ms before, then spin
+	private static readonly long SpinTicks = Stopwatch.Frequency / 1000;
+
+	private const uint HighResolutionTimer = 0x2;
+	private const uint TimerAllAccess = 0x1F0003;
 
 	// Start the frame this much before the slowest recent one would need
 	private static readonly long Margin = Stopwatch.Frequency / 2000;
+
+	// A Present this long before a vblank is on screen at it
+	private static readonly long VBlankLead = Stopwatch.Frequency * 7 / 2000;
 
 	private delegate void PresentDelegate(SwapChain* swapChain);
 
@@ -44,12 +53,16 @@ public unsafe class FramePacer: IDisposable
 	private long tickStart;
 	private long deadline;
 	private bool presented;
+	private readonly HANDLE timer = CreateWaitableTimerExW(null, null, HighResolutionTimer, TimerAllAccess);
 
 	// Back buffer content for the second Present, the discard swap effect leaves it undefined
 	private ID3D11Texture2D* held;
 
-	// Frame generation headroom: which of the last frames missed their slot
-	private static readonly long LateSlack = Stopwatch.Frequency / 1000;
+	// DWM's vblank grid, read when the schedule is aligned
+	private long vblank;
+	private long vblankPeriod;
+
+	// Frame generation headroom: which of the last frames' first Present missed its vblank
 	private readonly bool[] late = new bool[120];
 	private int lateIndex;
 	private int lateCount;
@@ -77,8 +90,9 @@ public unsafe class FramePacer: IDisposable
 	public bool Available { get; }
 
 	/// <summary>
-	/// Frame generation keeps up with the target: false once over 5% of the last 120 frames missed their slot, true again
-	/// under 1%, so it doesn't flicker
+	/// Frame generation keeps up with the target: false once over 5% of the last 120 frames lost their generated frame
+	/// (first Present later than its vblank lead, so it flips together with the second), true again under 1%, so it
+	/// doesn't flicker
 	/// </summary>
 	public bool KeepingUp { get; private set; } = true;
 
@@ -153,13 +167,15 @@ public unsafe class FramePacer: IDisposable
 		}
 
 		if (generate)
-			this.TrackHeadroom(this.deadline != 0 && now > this.deadline + LateSlack);
+			this.TrackHeadroom(this.deadline != 0 && now > this.deadline + VBlankLead);
 		else
 			this.ResetHeadroom();
 
-		// First frame or over a frame behind
-		if (this.deadline == 0 || now - this.deadline > period)
-			this.deadline = now;
+		// First frame, or behind by more than the second Present's slot, which would go out right after the first in the
+		// same vblank and lose the generated frame
+		long behind = generate ? period / 2 : period;
+		if (this.deadline == 0 || now - this.deadline > behind)
+			this.deadline = this.AlignToVBlank(now);
 
 		Wait(this.deadline);
 
@@ -184,6 +200,29 @@ public unsafe class FramePacer: IDisposable
 
 		this.deadline += period;
 		this.presented = true;
+	}
+
+	private bool ReadVBlank()
+	{
+		DWM_TIMING_INFO info = default;
+		info.cbSize = (uint)sizeof(DWM_TIMING_INFO);
+		if (!DwmGetCompositionTimingInfo(default, &info).SUCCEEDED)
+			return false;
+
+		this.vblank = (long)info.qpcVBlank;
+		this.vblankPeriod = (long)info.qpcRefreshPeriod;
+		return this.vblankPeriod > 0;
+	}
+
+	/// <summary>The first time at or after this one that a Present issued then reaches the screen at the next vblank</summary>
+	private long AlignToVBlank(long time)
+	{
+		if (!this.ReadVBlank())
+			return time;
+
+		long next = this.vblank + ((time - this.vblank) / this.vblankPeriod + 1) * this.vblankPeriod;
+		long aligned = next - VBlankLead;
+		return aligned >= time ? aligned : aligned + this.vblankPeriod;
 	}
 
 	private void TrackHeadroom(bool missed)
@@ -274,12 +313,25 @@ public unsafe class FramePacer: IDisposable
 
 	private long PredictedWork() => this.work.Max() + Margin;
 
-	private static void Wait(long until)
+	/// <summary>Waits on the high resolution timer until shortly before, then spins; the timer's tick isn't the game's</summary>
+	private void Wait(long until)
 	{
 		long now = Stopwatch.GetTimestamp();
-		while (until - now > SpinTicks)
+		long sleep = until - now - SpinTicks;
+		if (sleep > 0)
 		{
-			Thread.Sleep(1);
+			if (this.timer.Value != null)
+			{
+				LARGE_INTEGER due;
+				due.QuadPart = -sleep * 10_000_000 / Stopwatch.Frequency;
+				SetWaitableTimer(this.timer, &due, 0, null, null, false);
+				WaitForSingleObject(this.timer, INFINITE);
+			}
+			else
+			{
+				Thread.Sleep(1);
+			}
+
 			now = Stopwatch.GetTimestamp();
 		}
 
@@ -294,6 +346,8 @@ public unsafe class FramePacer: IDisposable
 	{
 		this.tickHook?.Dispose();
 		this.presentHook?.Dispose();
+		if (this.timer.Value != null)
+			CloseHandle(this.timer);
 		Dx.Release(this.held);
 		this.held = null;
 		GC.SuppressFinalize(this);

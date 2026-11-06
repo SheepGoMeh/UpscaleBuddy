@@ -23,6 +23,9 @@ public unsafe class Fsr3Upscaler: IUpscaler
 		public ID3D11Texture2D* Depth;
 		public ID3D11Texture2D* MotionVectors;
 		public ID3D11Texture2D* Output;
+
+		// R8, rain and VFX coverage (Game/EffectMask), null for none
+		public ID3D11Texture2D* Reactive;
 		public uint RenderWidth;
 		public uint RenderHeight;
 		public float JitterX;
@@ -275,6 +278,7 @@ public unsafe class Fsr3Upscaler: IUpscaler
 		ID3D11ShaderResourceView* depth = this.InputSrv(p.Depth);
 		ID3D11ShaderResourceView* motionVectors = this.InputSrv(p.MotionVectors);
 		ID3D11UnorderedAccessView* output = this.InputUav(p.Output);
+		ID3D11ShaderResourceView* reactive = p.Reactive != null ? this.InputSrv(p.Reactive) : this.defaultReactivity.Srv;
 
 		if (this.firstExecution)
 		{
@@ -323,7 +327,8 @@ public unsafe class Fsr3Upscaler: IUpscaler
 			"r_input_motion_vectors" => motionVectors,
 			"r_input_depth" => depth,
 			"r_input_exposure" => this.defaultExposure.Srv,
-			"r_reactive_mask" or "r_transparency_and_composition_mask" => this.defaultReactivity.Srv,
+			"r_reactive_mask" => reactive,
+			"r_transparency_and_composition_mask" => this.defaultReactivity.Srv,
 			"r_reconstructed_previous_nearest_depth" => this.reconstructedPreviousDepth.Srv,
 			"r_dilated_motion_vectors" => this.dilatedMotionVectors.Srv,
 			"r_dilated_depth" => this.dilatedDepth.Srv,

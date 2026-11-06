@@ -85,6 +85,9 @@ public unsafe class D3D12Upscaler: IUpscaler
 		Twin outputTwin = directOutput ?? (this.output ??= this.bridge.CreateTwin(Dx.GetDesc(p.Output).Format, this.UpscaleWidth, this.UpscaleHeight));
 		Twin depthTwin = this.depth ??= this.bridge.CreateTwin(DXGI_FORMAT_R32_FLOAT, this.MaxRenderWidth, this.MaxRenderHeight);
 
+		// Created shared by Game/EffectMask, never copied
+		Input reactive = p.Reactive != null && this.bridge.Direct(p.Reactive) is { } reactiveTwin ? reactiveTwin.Input : default;
+
 		// D3D11: game textures into the twins unless D3D12 reads them directly
 		if (directColor == null)
 			Bridge.Copy(context, colorTwin.Texture11, p.Color, colorTwin.Input);
@@ -99,7 +102,8 @@ public unsafe class D3D12Upscaler: IUpscaler
 		uint upscaleWidth = this.UpscaleWidth;
 		uint upscaleHeight = this.UpscaleHeight;
 		this.bridge.Execute(context,
-			list => backend.Record(list, colorTwin.Input, motionVectorsTwin.Input, depthTwin.Input, outputTwin.Input, parameters, upscaleWidth, upscaleHeight),
+			list => backend.Record(list, colorTwin.Input, motionVectorsTwin.Input, depthTwin.Input, reactive, outputTwin.Input, parameters,
+				upscaleWidth, upscaleHeight),
 			p.Measure);
 
 		// The output twin back into the game's output

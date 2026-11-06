@@ -80,7 +80,7 @@ foreach ($name in $passes.Keys) {
 }
 
 # Own shaders
-foreach ($name in @('downsample', 'depth_copy')) {
+foreach ($name in @('downsample', 'depth_copy', 'effect_reactive')) {
 	& $Fxc /nologo /T cs_5_0 /E CS /O3 /Fo (Join-Path $out "$name.cso") (Join-Path $PSScriptRoot "$name.hlsl") | Where-Object { $_ -match 'error' }
 	if ($LASTEXITCODE -ne 0) { throw "fxc failed for $name" }
 	Write-Host "$name : built"

@@ -31,9 +31,9 @@ public unsafe interface IBackend: IDisposable
 
 	/// <summary>
 	/// Records the upscale into the open command list; every texture arrives in COMMON state and has to be left in it.
-	/// Throws when the library fails, the list is then dropped
+	/// reactive (R8) has a null resource when there's none. Throws when the library fails, the list is then dropped
 	/// </summary>
-	void Record(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input output,
+	void Record(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input reactive, in Input output,
 		in Fsr3Upscaler.DispatchParams p, uint upscaleWidth, uint upscaleHeight);
 }
 

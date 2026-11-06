@@ -20,6 +20,7 @@ public unsafe class XessBackend: IBackend
 	private const string Dll = "libxess.dll";
 
 	private const uint InitInvertedDepth = 1 << 1;
+	private const uint InitResponsivePixelMask = 1 << 3;
 	private const uint InitLdrInputColor = 1 << 6;
 	private const int LoggingLevelWarning = 2;
 
@@ -96,7 +97,8 @@ public unsafe class XessBackend: IBackend
 
 	private nint context;
 
-	public XessBackend(ID3D12Device* device, uint maxRenderWidth, uint upscaleWidth, uint upscaleHeight)
+	/// <summary>responsiveMask: every dispatch then has a reactive texture, XeSS requires it once initialized with it</summary>
+	public XessBackend(ID3D12Device* device, uint maxRenderWidth, uint upscaleWidth, uint upscaleHeight, bool responsiveMask)
 	{
 		LoadLibrary();
 
@@ -112,7 +114,8 @@ public unsafe class XessBackend: IBackend
 			InitParams parameters = new()
 			{
 				OutputWidth = upscaleWidth, OutputHeight = upscaleHeight, QualitySetting = Quality(upscaleWidth / (float)maxRenderWidth),
-				InitFlags = InitInvertedDepth | InitLdrInputColor, CreationNodeMask = 1, VisibleNodeMask = 1,
+				InitFlags = InitInvertedDepth | InitLdrInputColor | (responsiveMask ? InitResponsivePixelMask : 0), CreationNodeMask = 1,
+				VisibleNodeMask = 1,
 			};
 			Check(init(created, &parameters), "xessD3D12Init");
 
@@ -130,13 +133,13 @@ public unsafe class XessBackend: IBackend
 
 	public string Label => "XeSS";
 
-	public void Record(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input output,
+	public void Record(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input reactive, in Input output,
 		in Fsr3Upscaler.DispatchParams p, uint upscaleWidth, uint upscaleHeight)
 	{
 		// NGX's MV.Scale and jitter use XeSS's conventions as they are
 		Check(setVelocityScale(this.context, p.MotionVectorScaleX, p.MotionVectorScaleY), "xessSetVelocityScale");
 
-		Transition(list, color, motionVectors, depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+		Transition(list, color, motionVectors, depth, reactive, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
 			output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
 		ExecuteParams parameters = new()
@@ -144,6 +147,7 @@ public unsafe class XessBackend: IBackend
 			ColorTexture = color.Resource,
 			VelocityTexture = motionVectors.Resource,
 			DepthTexture = depth.Resource,
+			ResponsivePixelMaskTexture = reactive.Resource,
 			OutputTexture = output.Resource,
 			JitterOffsetX = p.JitterX,
 			JitterOffsetY = p.JitterY,
@@ -154,22 +158,23 @@ public unsafe class XessBackend: IBackend
 		};
 		Check(execute(this.context, list, &parameters), "xessD3D12Execute");
 
-		Transition(list, color, motionVectors, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON,
+		Transition(list, color, motionVectors, depth, reactive, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON,
 			output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 	}
 
-	private static void Transition(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth,
+	private static void Transition(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input reactive,
 		D3D12_RESOURCE_STATES inputFrom, D3D12_RESOURCE_STATES inputTo, in Input output, D3D12_RESOURCE_STATES outputFrom,
 		D3D12_RESOURCE_STATES outputTo)
 	{
-		D3D12_RESOURCE_BARRIER* barriers = stackalloc D3D12_RESOURCE_BARRIER[4]
+		D3D12_RESOURCE_BARRIER* barriers = stackalloc D3D12_RESOURCE_BARRIER[5]
 		{
 			D3D12_RESOURCE_BARRIER.InitTransition(color.Resource, inputFrom, inputTo),
 			D3D12_RESOURCE_BARRIER.InitTransition(motionVectors.Resource, inputFrom, inputTo),
 			D3D12_RESOURCE_BARRIER.InitTransition(depth.Resource, inputFrom, inputTo),
 			D3D12_RESOURCE_BARRIER.InitTransition(output.Resource, outputFrom, outputTo),
+			D3D12_RESOURCE_BARRIER.InitTransition(reactive.Resource, inputFrom, inputTo),
 		};
-		list->ResourceBarrier(4, barriers);
+		list->ResourceBarrier(reactive.Resource != null ? 5u : 4u, barriers);
 	}
 
 	/// <summary>The preset whose legacy ratio is closest to the actual one</summary>

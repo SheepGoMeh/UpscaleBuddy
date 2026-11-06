@@ -134,6 +134,7 @@ public static unsafe class FfxApi
 		DXGI_FORMAT_R16G16_FLOAT => 18,
 		DXGI_FORMAT_R32_FLOAT => 28,
 		DXGI_FORMAT_R16_FLOAT => 21,
+		DXGI_FORMAT_R8_UNORM => 25,
 		DXGI_FORMAT_B8G8R8A8_UNORM => 14,
 		_ => throw new NotSupportedException($"{format} has no FFX equivalent here"),
 	};

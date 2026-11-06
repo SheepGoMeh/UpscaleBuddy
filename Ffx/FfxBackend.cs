@@ -91,7 +91,7 @@ public unsafe class FfxBackend: IBackend
 
 	public string Label => "FSR";
 
-	public void Record(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input output,
+	public void Record(ID3D12GraphicsCommandList* list, in Input color, in Input motionVectors, in Input depth, in Input reactive, in Input output,
 		in Fsr3Upscaler.DispatchParams p, uint upscaleWidth, uint upscaleHeight)
 	{
 		DispatchUpscale desc = new()
@@ -101,6 +101,7 @@ public unsafe class FfxBackend: IBackend
 			Color = Describe(color),
 			Depth = Describe(depth),
 			MotionVectors = Describe(motionVectors),
+			Reactive = reactive.Resource != null ? Describe(reactive) : default,
 			Output = Describe(output),
 			JitterX = p.JitterX,
 			JitterY = p.JitterY,

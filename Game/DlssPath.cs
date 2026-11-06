@@ -91,6 +91,7 @@ public unsafe class DlssPath: IDisposable
 		uint OutputHeight, bool InfiniteFar);
 
 	private readonly UpscaleBuddyConfiguration configuration;
+	private readonly EffectMask effectMask;
 	private readonly NgxParameters parameters = new();
 	private readonly Hook<InitDelegate>? initHook;
 	private readonly Hook<CapabilitiesDelegate>? capabilitiesHook;
@@ -159,9 +160,10 @@ public unsafe class DlssPath: IDisposable
 	private int releaseFramesLeft;
 	private int rejections;
 
-	public DlssPath(UpscaleBuddyConfiguration configuration)
+	public DlssPath(UpscaleBuddyConfiguration configuration, EffectMask effectMask)
 	{
 		this.configuration = configuration;
+		this.effectMask = effectMask;
 		this.parameters.SetNumber("SuperSampling.Available", 1);
 		this.parameters.SetNumber("SuperSampling.NeedsUpdatedDriver", 0);
 		this.parameters.SetNumber("SuperSampling.MinDriverVersionMajor", 0);
@@ -354,6 +356,7 @@ public unsafe class DlssPath: IDisposable
 		if (!this.supportChecked)
 			this.CheckNativeSupport();
 
+		this.effectMask.Configure(this.Running, this.configuration.EffectResponsiveness);
 		bool native = this.NativeDlssSupported && this.configuration.Upscaler == Upscaler.NvidiaDlss;
 		this.UpdateNative(native);
 		bool wanted = !native && this.configuration.Mode != UpscaleMode.Off && GameSettingIsFsr();
@@ -708,14 +711,14 @@ public unsafe class DlssPath: IDisposable
 		return NgxParameters.Success;
 	}
 
-	/// <summary>A D3D12 library on the shim, created with the device the shim makes</summary>
+	/// <summary>A D3D12 library on the shim, created with the device the shim makes; reactive: every dispatch has a reactive mask</summary>
 	private static IUpscaler CreateD3D12(ID3D11Device* device, Upscaler selected, uint renderWidth, uint renderHeight, uint upscaleWidth,
-		uint upscaleHeight, bool infiniteFar) => selected switch
+		uint upscaleHeight, bool infiniteFar, bool reactive) => selected switch
 	{
 		Upscaler.AmdFsr => new D3D12Upscaler(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight,
 			d3d12 => new FfxBackend(d3d12, renderWidth, renderHeight, upscaleWidth, upscaleHeight, infiniteFar)),
 		Upscaler.IntelXess => new D3D12Upscaler(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight,
-			d3d12 => new XessBackend(d3d12, renderWidth, upscaleWidth, upscaleHeight)),
+			d3d12 => new XessBackend(d3d12, renderWidth, upscaleWidth, upscaleHeight, reactive)),
 		_ => throw new ArgumentOutOfRangeException(nameof(selected), selected, null),
 	};
 
@@ -763,7 +766,8 @@ public unsafe class DlssPath: IDisposable
 			{
 				try
 				{
-					created = CreateD3D12(device, selected, renderWidth, renderHeight, upscaleWidth, upscaleHeight, this.infiniteFar);
+					created = CreateD3D12(device, selected, renderWidth, renderHeight, upscaleWidth, upscaleHeight, this.infiniteFar,
+						this.effectMask.Available);
 				}
 				catch (Exception e)
 				{
@@ -879,8 +883,10 @@ public unsafe class DlssPath: IDisposable
 		try
 		{
 			long start = Stopwatch.GetTimestamp();
+			dispatch.Reactive = this.effectMask.Resolve(context, dispatch.Color);
 			current.Dispatch(context, dispatch);
-			currentDownsampler?.Dispatch(context, dispatch.Output, current.UpscaleWidth, current.UpscaleHeight, gameOutput, this.OutputWidth, this.OutputHeight);
+			currentDownsampler?.Dispatch(context, dispatch.Output, current.UpscaleWidth, current.UpscaleHeight, gameOutput, this.OutputWidth,
+				this.OutputHeight);
 			if (dispatch.Measure)
 			{
 				double ms = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
@@ -927,11 +933,18 @@ public unsafe class DlssPath: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread, the game's own DLSS: it runs as it is, and the inputs it was given are kept for frame generation (the same
-	/// parameters the shim reads, from the game's real NGX parameter object)
+	/// Render thread, the game's own DLSS: it runs as it is with the effects' reactive mask as its bias towards the current color,
+	/// and the inputs it was given are kept for frame generation (the same parameters the shim reads, from the game's real NGX
+	/// parameter object)
 	/// </summary>
 	private int EvaluateNative(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
 	{
+		if (parameterObject != 0)
+		{
+			ID3D11Texture2D* reactive = this.effectMask.Resolve(context, (ID3D11Texture2D*)NgxParameterReader.Pointer(parameterObject, "Color"));
+			NgxParameterReader.Resource(parameterObject, "DLSS.Input.Bias.Current.Color.Mask", reactive);
+		}
+
 		int result = this.evaluateHook!.Original(context, handle, parameterObject, progress);
 		if (result != NgxParameters.Success || parameterObject == 0)
 			return result;

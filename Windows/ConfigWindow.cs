@@ -9,7 +9,7 @@ using UpscaleBuddy.Game;
 namespace UpscaleBuddy.Windows;
 
 public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlssPath, FramePacer framePacer, UiLayer uiLayer,
-	FrameGenerationRunner frameGeneration, ClipboardGuard clipboardGuard)
+	FrameGenerationRunner frameGeneration, ClipboardGuard clipboardGuard, EffectMask effectMask)
 	: Window("UpscaleBuddy", ImGuiWindowFlags.AlwaysAutoResize)
 {
 	// Saved as the enum value, the list order is independent
@@ -71,6 +71,17 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			configuration.Save();
 		ImGui.EndDisabled();
 		ImGui.EndDisabled();
+
+		ImGui.BeginDisabled(!effectMask.Available);
+		if (ImGui.SliderFloat("Rain and effects responsiveness", ref configuration.EffectResponsiveness, 0.0f, 10.0f, "%.1f"))
+			configuration.Save();
+		ImGui.EndDisabled();
+		if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+		{
+			ImGui.SetTooltip(
+				"How strongly the upscaler keeps rain and spell effects from the current frame instead of blending them\n" +
+				"away. Works with XeSS, FSR 3.1 and DLSS; FSR 4 doesn't use it. 0 turns it off.");
+		}
 
 		if (ImGui.Checkbox("Show timings", ref configuration.ShowTimings))
 			configuration.Save();

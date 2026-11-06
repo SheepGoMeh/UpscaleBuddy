@@ -21,6 +21,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 	private readonly UiLayer uiLayer;
 	private readonly FramePacer framePacer;
 	private readonly ClipboardGuard clipboardGuard;
+	private readonly EffectMask effectMask;
 	private readonly WindowSystem windowSystem;
 	private readonly ConfigWindow configWindow;
 
@@ -31,7 +32,8 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		this.configuration = Service.PluginInterface.GetPluginConfig() as UpscaleBuddyConfiguration ??
 		                     new UpscaleBuddyConfiguration();
 
-		this.dlssPath = new DlssPath(this.configuration);
+		this.effectMask = new EffectMask();
+		this.dlssPath = new DlssPath(this.configuration, this.effectMask);
 		this.frameGeneration = new FrameGenerationRunner(this.configuration, this.dlssPath);
 		this.uiLayer = new UiLayer(this.configuration, this.frameGeneration);
 		this.framePacer = new FramePacer(this.configuration, this.uiLayer);
@@ -39,7 +41,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 
 		this.windowSystem = new WindowSystem("UpscaleBuddy");
 		this.configWindow = new ConfigWindow(this.configuration, this.dlssPath, this.framePacer, this.uiLayer, this.frameGeneration,
-			this.clipboardGuard);
+			this.clipboardGuard, this.effectMask);
 		this.windowSystem.AddWindow(this.configWindow);
 
 		Service.PluginInterface.UiBuilder.Draw += this.windowSystem.Draw;
@@ -74,6 +76,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		{
 			this.dlssPath.Stop();
 			this.uiLayer.Stop();
+			this.effectMask.Stop();
 		}).Wait();
 		Thread.Sleep(200);
 		Service.Framework.RunOnFrameworkThread(() =>
@@ -83,6 +86,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 			this.frameGeneration.Dispose();
 		}).Wait();
 		this.dlssPath.Dispose();
+		Service.Framework.RunOnFrameworkThread(this.effectMask.Dispose).Wait();
 	}
 
 	public void Dispose()

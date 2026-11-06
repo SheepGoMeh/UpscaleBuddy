@@ -4,13 +4,15 @@ using System.Text;
 namespace UpscaleBuddy.Game;
 
 /// <summary>
-/// Reads values out of the game's real NVSDK_NGX_Parameter (the one NGX made, not <see cref="NgxParameters"/>) through its vtable
+/// Reads values out of the game's real NVSDK_NGX_Parameter (the one NGX made, not <see cref="NgxParameters"/>) through its vtable,
+/// and sets resources on it
 /// </summary>
 internal static unsafe class NgxParameterReader
 {
 	private const int Success = 1;
 
-	// MSVC reverse overload order: 8 GetVoidPointer, 10 GetD3d11Resource, 11 GetI, 12 GetUI, 13 GetD, 14 GetF
+	// MSVC reverse overload order: 2 SetD3d11Resource, 8 GetVoidPointer, 10 GetD3d11Resource, 11 GetI, 12 GetUI, 13 GetD, 14 GetF
+	private const int SetResource = 2;
 	private const int GetVoidPointer = 8;
 	private const int GetResource = 10;
 	private const int GetInt = 11;
@@ -74,6 +76,14 @@ internal static unsafe class NgxParameterReader
 			pointer = 0;
 			return ((delegate* unmanaged<nint, byte*, nint*, int>)table[GetVoidPointer])(parameters, key, &pointer) == Success ? pointer : 0;
 		}
+	}
+
+	/// <summary>A D3D11 resource under name, null clears it</summary>
+	public static void Resource(nint parameters, string name, void* resource)
+	{
+		nint* table = *(nint**)parameters;
+		fixed (byte* key = Key(name))
+			((delegate* unmanaged<nint, byte*, void*, void>)table[SetResource])(parameters, key, resource);
 	}
 
 	private static byte[] Key(string name)

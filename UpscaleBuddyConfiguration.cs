@@ -36,6 +36,9 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	public bool ShowTimings;
 	public Upscaler Upscaler = Upscaler.BuiltInFsr3;
 
+	// Rain and VFX alpha times this is the upscalers' reactive mask (Game/EffectMask); rain's alpha is faint, about 0.1. 0 = off
+	public float EffectResponsiveness = 4.0f;
+
 	// The D3D12 upscalers open SceneInput/SceneOutput/velocity directly instead of copying them; only shown in Debug builds
 	// until it's measured whether shared targets cost the game's passes more than the copies
 	public bool ZeroCopy = true;

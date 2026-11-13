@@ -54,6 +54,9 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 	// Frames shown per second with frame generation, 0 = the display's refresh rate
 	public int FrameGenerationTarget;
 
+	// Sync interval 1 for frame generation's Presents, else 0
+	public bool FrameGenerationVsync = true;
+
 	// Applies ReShade's effects to the scene before the UI, not to the finished frame (Game/ReShadeEffects)
 	public bool ReShadeBeforeUi;
 

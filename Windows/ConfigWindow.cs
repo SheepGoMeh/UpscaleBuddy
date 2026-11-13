@@ -180,6 +180,11 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 			}
 		}
 
+		if (ImGui.Checkbox("Vsync", ref configuration.FrameGenerationVsync))
+			configuration.Save();
+		if (ImGui.IsItemHovered())
+			ImGui.SetTooltip("On: no tearing. Off: frames can appear a little sooner, but you can see tearing.");
+
 		// Each real frame waits half a rendered frame behind the generated one, plus about 1 ms of generation
 		int rendered = framePacer.GenerationRate;
 		if (rendered > 0)

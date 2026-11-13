@@ -71,6 +71,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		this.windowSystem.RemoveAllWindows();
 
 		// Present and the tick wait run on the framework thread
+		this.framePacer.StopPresenter();
 		Service.Framework.RunOnFrameworkThread(this.framePacer.Dispose).Wait();
 
 		// Give queued render commands (upscaler, UI composite) time to finish before the teardown.

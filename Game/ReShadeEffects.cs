@@ -124,6 +124,11 @@ public unsafe class ReShadeEffects: IDisposable
 	/// <summary>True when ReShade is loaded and accepted the add-on</summary>
 	public bool Available { get; }
 
+	/// <summary>
+	/// Serializes render_effects with Presents off the main thread. ReShade deadlocks when they overlap
+	/// </summary>
+	public object PresentLock { get; } = new();
+
 	/// <summary>Main thread. True when the effects go on the scene before the UI in this frame</summary>
 	public bool Active => this.configuration.ReShadeBeforeUi && this.runtime != 0;
 
@@ -138,7 +143,8 @@ public unsafe class ReShadeEffects: IDisposable
 
 		ID3D11RenderTargetView* view = (ID3D11RenderTargetView*)target->GetMipRenderTarget(0)->D3D11RenderTargetViewOrDepthStencilView;
 		ID3D11RenderTargetView* srgb = this.SrgbView((ID3D11Texture2D*)target->D3D11Texture2D);
-		RenderEffects(current, (nint)view, (nint)(srgb != null ? srgb : view));
+		lock (this.PresentLock)
+			RenderEffects(current, (nint)view, (nint)(srgb != null ? srgb : view));
 		Interlocked.Exchange(ref this.rendered, 1);
 	}
 
@@ -149,13 +155,15 @@ public unsafe class ReShadeEffects: IDisposable
 	public bool TakeRendered() => Interlocked.Exchange(ref this.rendered, 0) != 0;
 
 	/// <summary>
-	/// Main thread, before the second Present of a frame that already contains the effects. Calls render_effects
-	/// without a target. ReShade then only updates its uniforms. The next Present skips its pass
+	/// Makes ReShade skip its pass at the next Present, for frames that already have the effects
 	/// </summary>
 	public void SkipNextPresent()
 	{
 		nint current = this.runtime;
-		if (current != 0)
+		if (current == 0)
+			return;
+
+		lock (this.PresentLock)
 			RenderEffects(current, 0, 0);
 	}
 

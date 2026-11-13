@@ -25,12 +25,6 @@ namespace UpscaleBuddy.Game;
 /// </summary>
 public unsafe class FramePacer: IDisposable
 {
-	// Wait on the timer until 1 ms before, then spin
-	private static readonly long SpinTicks = Stopwatch.Frequency / 1000;
-
-	private const uint HighResolutionTimer = 0x2;
-	private const uint TimerAllAccess = 0x1F0003;
-
 	// Start the frame this much before the slowest recent one would need
 	private static readonly long Margin = Stopwatch.Frequency / 2000;
 
@@ -45,6 +39,14 @@ public unsafe class FramePacer: IDisposable
 	private readonly ReShadeEffects reShade;
 	private readonly Hook<Framework.Delegates.Tick>? tickHook;
 	private readonly Hook<PresentDelegate>? presentHook;
+	private readonly Presenter presenter;
+	private readonly HighResolutionTimer timer = new();
+
+	private readonly Action presentWithoutLimit;
+	private SwapChain* presenting;
+	private uint presentingSyncInterval;
+
+	private volatile bool stopping;
 
 	// Main thread. The time from tick start to Present for each of the last frames
 	private readonly long[] work = new long[32];
@@ -57,7 +59,6 @@ public unsafe class FramePacer: IDisposable
 	private long tickStart;
 	private long deadline;
 	private bool presented;
-	private readonly HANDLE timer = CreateWaitableTimerExW(null, null, HighResolutionTimer, TimerAllAccess);
 
 	// Back buffer content for the second Present. The discard swap effect leaves the back buffer undefined.
 	private ID3D11Texture2D* held;
@@ -78,6 +79,8 @@ public unsafe class FramePacer: IDisposable
 		this.uiLayer = uiLayer;
 		this.frameGeneration = frameGeneration;
 		this.reShade = reShade;
+		this.presenter = new Presenter(uiLayer, reShade);
+		this.presentWithoutLimit = this.PresentWithoutLimit;
 		try
 		{
 			this.tickHook = Service.GameInteropProvider.HookFromAddress<Framework.Delegates.Tick>(
@@ -148,7 +151,7 @@ public unsafe class FramePacer: IDisposable
 		if (this.presented)
 		{
 			this.presented = false;
-			Wait(this.deadline - this.PredictedWork());
+			this.timer.Wait(this.deadline - this.PredictedWork());
 		}
 
 		this.tickStart = Stopwatch.GetTimestamp();
@@ -160,12 +163,18 @@ public unsafe class FramePacer: IDisposable
 		Device* device = Device.Instance();
 		int generated = this.frameGeneration.Enabled ? this.GeneratedRate(device) : 0;
 		bool generate = generated != 0;
-		if (!generate && swapChain == device->SwapChain)
+		bool game = swapChain == device->SwapChain;
+		if (!generate)
+			this.presenter.ResetFailure();
+		bool threaded = generate && game && !this.stopping && this.presenter.Usable(swapChain);
+		if (!threaded)
+			this.presenter.Release();
+		if (!generate && game)
 			this.uiLayer.DiscardRegenerated();
-		bool effects = swapChain == device->SwapChain && this.reShade.TakeRendered();
+		bool effects = game && this.reShade.TakeRendered();
 
 		int rate = generate ? generated : this.LimitedRate(device);
-		if (swapChain != device->SwapChain || rate == 0)
+		if (!game || rate == 0)
 		{
 			this.deadline = 0;
 			this.ResetHeadroom();
@@ -194,7 +203,20 @@ public unsafe class FramePacer: IDisposable
 		if (this.deadline == 0 || now - this.deadline > behind)
 			this.deadline = this.AlignToVBlank(now);
 
-		Wait(this.deadline);
+		this.timer.Wait(this.deadline);
+
+		this.presenting = swapChain;
+		uint syncInterval = this.configuration.FrameGenerationVsync ? 1u : 0u;
+		this.presentingSyncInterval = syncInterval;
+		long presentStart = Stopwatch.GetTimestamp();
+		if (threaded && this.presenter.Present(device, swapChain, this.deadline + period / 2, syncInterval, effects, this.presentWithoutLimit))
+		{
+			this.halves[this.halfIndex] = (frameWork + Stopwatch.GetTimestamp() - presentStart) / 2;
+			this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
+			this.deadline += period;
+			this.presented = true;
+			return;
+		}
 
 		// Cap 0 skips the game's sleep. Preset 1 is sync interval 1.
 		uint preset = device->FrameRateLimitPresetPresent;
@@ -202,7 +224,7 @@ public unsafe class FramePacer: IDisposable
 		device->FrameRateLimitPresent = 0;
 		if (generate)
 		{
-			device->FrameRateLimitPresetPresent = 1;
+			device->FrameRateLimitPresetPresent = syncInterval;
 			(long first, long second) = this.PresentTwice(device, swapChain, period, effects);
 			this.halves[this.halfIndex] = Math.Max(first, frameWork + second);
 			this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
@@ -217,6 +239,29 @@ public unsafe class FramePacer: IDisposable
 
 		this.deadline += period;
 		this.presented = true;
+	}
+
+	private void PresentWithoutLimit()
+	{
+		Device* device = Device.Instance();
+		uint preset = device->FrameRateLimitPresetPresent;
+		ushort cap = device->FrameRateLimitPresent;
+		device->FrameRateLimitPresent = 0;
+		device->FrameRateLimitPresetPresent = this.presentingSyncInterval;
+		this.presentHook!.Original(this.presenting);
+		device->FrameRateLimitPresetPresent = preset;
+		device->FrameRateLimitPresent = cap;
+	}
+
+	/// <summary>
+	/// Blocks until the next Present restores the back buffer, at most 1 s. Required before Dispose. Not on the framework
+	/// thread, which runs that Present
+	/// </summary>
+	public void StopPresenter()
+	{
+		this.stopping = true;
+		for (int i = 0; i < 100 && this.presenter.Active; i++)
+			Thread.Sleep(10);
 	}
 
 	private bool ReadVBlank()
@@ -312,7 +357,7 @@ public unsafe class FramePacer: IDisposable
 		long first = Stopwatch.GetTimestamp() - start;
 
 		context->CopyResource((ID3D11Resource*)backBuffer, (ID3D11Resource*)this.held);
-		Wait(this.deadline + period / 2);
+		this.timer.Wait(this.deadline + period / 2);
 		if (effects)
 			this.reShade.SkipNextPresent();
 		start = Stopwatch.GetTimestamp();
@@ -341,44 +386,12 @@ public unsafe class FramePacer: IDisposable
 
 	private long PredictedWork() => this.work.Max() + Margin;
 
-	/// <summary>
-	/// Waits on the high resolution timer until shortly before the time, then spins. The timer's tick is not the game's
-	/// tick.
-	/// </summary>
-	private void Wait(long until)
-	{
-		long now = Stopwatch.GetTimestamp();
-		long sleep = until - now - SpinTicks;
-		if (sleep > 0)
-		{
-			if (this.timer.Value != null)
-			{
-				LARGE_INTEGER due;
-				due.QuadPart = -sleep * 10_000_000 / Stopwatch.Frequency;
-				SetWaitableTimer(this.timer, &due, 0, null, null, false);
-				WaitForSingleObject(this.timer, INFINITE);
-			}
-			else
-			{
-				Thread.Sleep(1);
-			}
-
-			now = Stopwatch.GetTimestamp();
-		}
-
-		while (now < until)
-		{
-			Thread.SpinWait(16);
-			now = Stopwatch.GetTimestamp();
-		}
-	}
-
 	public void Dispose()
 	{
 		this.tickHook?.Dispose();
 		this.presentHook?.Dispose();
-		if (this.timer.Value != null)
-			CloseHandle(this.timer);
+		this.presenter.Dispose();
+		this.timer.Dispose();
 		Dx.Release(this.held);
 		this.held = null;
 		GC.SuppressFinalize(this);

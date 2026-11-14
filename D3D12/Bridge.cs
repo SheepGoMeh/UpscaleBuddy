@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 
+using Dalamud.Utility;
+
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
 
@@ -98,6 +100,9 @@ public unsafe class Bridge: IDisposable
 			ThrowIfFailed(adapterResult);
 			ID3D12Device* createdDevice;
 			HRESULT deviceResult = D3D12CreateDevice((IUnknown*)adapter, D3D_FEATURE_LEVEL_11_0, __uuidof<ID3D12Device>(), (void**)&createdDevice);
+			if (deviceResult.FAILED && Util.IsWine())
+				deviceResult = WineVkd3d.CreateDevice((IUnknown*)adapter, &createdDevice);
+
 			adapter->Release();
 			ThrowIfFailed(deviceResult);
 			this.device12 = createdDevice;

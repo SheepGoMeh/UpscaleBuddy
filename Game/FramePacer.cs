@@ -106,6 +106,9 @@ public unsafe class FramePacer: IDisposable
 	/// </summary>
 	public bool KeepingUp { get; private set; } = true;
 
+	/// <summary>True when Dalamud draws inside Present1. Frame generation then presents on the game's thread</summary>
+	public bool DalamudInPresent1 => this.presenter.DalamudInPresent1;
+
 	/// <summary>
 	/// The target that the recent frames would hold. Each rendered frame has two halves:
 	/// - The first Present.
@@ -225,7 +228,7 @@ public unsafe class FramePacer: IDisposable
 		if (generate)
 		{
 			device->FrameRateLimitPresetPresent = syncInterval;
-			(long first, long second) = this.PresentTwice(device, swapChain, period, effects);
+			(long first, long second) = this.PresentTwice(device, swapChain, period, syncInterval, effects);
 			this.halves[this.halfIndex] = Math.Max(first, frameWork + second);
 			this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
 		}
@@ -342,14 +345,17 @@ public unsafe class FramePacer: IDisposable
 	/// - The blt swapchain does not hold the second Present for the next vblank.
 	/// - The compositor only shows the newer one.
 	/// When effects is true, the frame already contains ReShade's effects. Neither Present runs ReShade's pass.
+	/// While the presenter's NeedsProbe is true, the second Present is the presenter's probe.
 	/// </summary>
 	/// <returns>How long each Present call took, ours and whatever else runs inside it</returns>
-	private (long First, long Second) PresentTwice(Device* device, SwapChain* swapChain, long period, bool effects)
+	private (long First, long Second) PresentTwice(Device* device, SwapChain* swapChain, long period, uint syncInterval, bool effects)
 	{
 		ID3D11DeviceContext* context = (ID3D11DeviceContext*)device->D3D11DeviceContext;
 		ID3D11Texture2D* backBuffer = (ID3D11Texture2D*)swapChain->BackBuffer->D3D11Texture2D;
 		this.Hold(context, backBuffer);
 
+		bool probe = this.presenter.NeedsProbe(swapChain);
+		int draws = probe ? this.presenter.StartProbe() : 0;
 		long start = Stopwatch.GetTimestamp();
 		context->CopyResource((ID3D11Resource*)this.held, (ID3D11Resource*)backBuffer);
 		this.uiLayer.CopyRegenerated(swapChain);
@@ -361,7 +367,10 @@ public unsafe class FramePacer: IDisposable
 		if (effects)
 			this.reShade.SkipNextPresent();
 		start = Stopwatch.GetTimestamp();
-		this.presentHook!.Original(swapChain);
+		if (probe)
+			this.presenter.FinishProbe(swapChain, syncInterval, draws);
+		else
+			this.presentHook!.Original(swapChain);
 		return (first, Stopwatch.GetTimestamp() - start);
 	}
 

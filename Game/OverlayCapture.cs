@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 using Dalamud.Bindings.ImGui;
 
@@ -15,6 +16,7 @@ internal sealed unsafe class OverlayCapture: IDisposable
 	private ID3D11DeviceContext* context;
 	private ID3D11RenderTargetView* view;
 	private volatile bool armed;
+	private int draws;
 
 	public OverlayCapture()
 	{
@@ -41,8 +43,13 @@ internal sealed unsafe class OverlayCapture: IDisposable
 
 	public void Disarm() => this.armed = false;
 
+	/// <summary>The number of Dalamud frames that called OnDraw. Dalamud skips OnDraw while it hides plugin UI, unless
+	/// KeepDrawing is on</summary>
+	public int Draws => Volatile.Read(ref this.draws);
+
 	private void OnDraw()
 	{
+		Interlocked.Increment(ref this.draws);
 		if (!this.armed)
 			return;
 

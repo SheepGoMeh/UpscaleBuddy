@@ -201,6 +201,14 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 				: "The game is too slow here for frame generation.");
 		}
 
+		if (framePacer.DalamudInPresent1)
+		{
+			ImGui.TextColored(ImGuiColors.DalamudOrange,
+				"Dalamud's ReShade setting makes frame generation slower. Frame generation still works, but you may need a lower target.\n" +
+				"To fix this, open Dalamud Settings > Experimental and set \"ReShade handling mode\" to \"Default\".\n" +
+				"Then restart the game.");
+		}
+
 		ImGui.TextDisabled(frameGeneration.Paused
 			? "Paused while you are AFK or the game window is in the background."
 			: frameGeneration.Status);

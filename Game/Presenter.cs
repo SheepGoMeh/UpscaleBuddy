@@ -16,8 +16,11 @@ namespace UpscaleBuddy.Game;
 /// <summary>
 /// - While active, the back buffer's Kernel texture holds our texture (+0x68, +0x80[0]). The render thread writes the
 ///   next frame during this thread's Present.
-/// - Exactly one game Present per rendered frame. Dalamud draws only in the game's Present, not in Present1. An extra
-///   Present can fill the flip queue, which blocks Presents with sync interval 1 for about a refresh.
+/// - Exactly one game Present per rendered frame. An extra Present can fill the flip queue. A full flip queue blocks
+///   Presents with sync interval 1 for about one refresh.
+/// - Dalamud must not draw inside Present1. A Present1 on this thread would run Dalamud's UI on this thread. Dalamud's
+///   ReShade handling modes other than Default draw inside ReShade's Present1. Usable is false until a main thread
+///   probe (StartProbe, FinishProbe) shows that Dalamud does not draw there.
 /// </summary>
 public sealed unsafe class Presenter: IDisposable
 {
@@ -42,6 +45,10 @@ public sealed unsafe class Presenter: IDisposable
 	private Thread? thread;
 	private volatile bool running;
 	private volatile bool failed;
+
+	// The swap chain that dalamudInPresent1 applies to. Null means no probe result
+	private IDXGISwapChain* probedSwapChain;
+	private bool? dalamudInPresent1;
 
 	private ID3D11DeviceContext* context;
 	private IDXGISwapChain1* swapChain;
@@ -80,12 +87,58 @@ public sealed unsafe class Presenter: IDisposable
 
 	public bool Active => this.backBuffer != null;
 
-	/// <summary>Exclusive fullscreen is not tested</summary>
+	/// <summary>True when Dalamud draws inside Present1. Frame generation then presents on the game's thread</summary>
+	public bool DalamudInPresent1 => this.dalamudInPresent1 == true;
+
+	/// <summary>Exclusive fullscreen is not tested. A probe of this swap chain must show that Dalamud does not draw
+	/// inside Present1</summary>
 	public bool Usable(SwapChain* kernelSwapChain)
 	{
 		IDXGISwapChain* dxgi = (IDXGISwapChain*)kernelSwapChain->DXGISwapChain;
 		BOOL fullscreen = false;
-		return !this.failed && dxgi != null && dxgi->GetFullscreenState(&fullscreen, null).SUCCEEDED && !fullscreen;
+		return !this.failed && dxgi != null && dxgi == this.probedSwapChain && this.dalamudInPresent1 == false &&
+		       dxgi->GetFullscreenState(&fullscreen, null).SUCCEEDED && !fullscreen;
+	}
+
+	/// <summary>True when this swap chain has no probe result</summary>
+	public bool NeedsProbe(SwapChain* kernelSwapChain)
+	{
+		IDXGISwapChain* dxgi = (IDXGISwapChain*)kernelSwapChain->DXGISwapChain;
+		return dxgi != null && (dxgi != this.probedSwapChain || this.dalamudInPresent1 == null);
+	}
+
+	/// <summary>
+	/// Main thread, before the first of two game Presents. Keeps Dalamud's draw callback running while Dalamud hides
+	/// plugin UI. Returns the draw count for FinishProbe
+	/// </summary>
+	public int StartProbe()
+	{
+		this.overlay.KeepDrawing(true);
+		return this.overlay.Draws;
+	}
+
+	/// <summary>
+	/// Main thread, in place of the second game Present. Presents with Present1. Records whether Dalamud drew inside
+	/// it, only when Dalamud drew inside the first Present. Without a result, NeedsProbe stays true
+	/// </summary>
+	public void FinishProbe(SwapChain* kernelSwapChain, uint syncInterval, int drawsBeforeFirstPresent)
+	{
+		IDXGISwapChain* dxgi = (IDXGISwapChain*)kernelSwapChain->DXGISwapChain;
+		int drawsBeforePresent1 = this.overlay.Draws;
+		IDXGISwapChain1* swapChain1 = Dx.Query<IDXGISwapChain1>(dxgi);
+		DXGI_PRESENT_PARAMETERS parameters = default;
+		lock (this.reShade.PresentLock)
+			swapChain1->Present1(syncInterval, 0, &parameters);
+		swapChain1->Release();
+		this.overlay.KeepDrawing(false);
+
+		if (drawsBeforePresent1 == drawsBeforeFirstPresent)
+			return;
+
+		this.probedSwapChain = dxgi;
+		this.dalamudInPresent1 = this.overlay.Draws != drawsBeforePresent1;
+		if (this.dalamudInPresent1 == true)
+			Service.PluginLog.Warning("Dalamud draws inside Present1. Frame generation presents on the game's thread. Dalamud's ReShade handling modes other than Default cause this.");
 	}
 
 	public void ResetFailure() => this.failed = false;

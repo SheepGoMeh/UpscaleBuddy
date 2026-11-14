@@ -44,7 +44,6 @@ public sealed unsafe class Presenter: IDisposable
 	private volatile bool failed;
 
 	private ID3D11DeviceContext* context;
-	private ID3D11Multithread* multithread;
 	private IDXGISwapChain1* swapChain;
 	private ID3D11Texture2D* buffer;
 	private ID3D11RenderTargetView* bufferView;
@@ -185,11 +184,9 @@ public sealed unsafe class Presenter: IDisposable
 	private void ShowReal()
 	{
 		DXGI_PRESENT_PARAMETERS parameters = default;
-		this.multithread->Enter();
 		this.context->CopyResource((ID3D11Resource*)this.buffer, (ID3D11Resource*)this.real);
 		if (this.layerDrawn)
 			this.blend.Draw(this.context, this.bufferView, this.width, this.height, this.layerResource, true);
-		this.multithread->Leave();
 
 		int result;
 		lock (this.reShade.PresentLock)
@@ -234,8 +231,9 @@ public sealed unsafe class Presenter: IDisposable
 				ID3D11DeviceContext* immediate;
 				d3dDevice->GetImmediateContext(&immediate);
 				this.context = immediate;
-				this.multithread = Dx.Query<ID3D11Multithread>(this.context);
-				this.multithread->SetMultithreadProtected(true);
+				ID3D11Multithread* multithread = Dx.Query<ID3D11Multithread>(this.context);
+				multithread->SetMultithreadProtected(true);
+				multithread->Release();
 
 				D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(this.buffer);
 				this.width = desc.Width;
@@ -332,7 +330,6 @@ public sealed unsafe class Presenter: IDisposable
 		Dx.Release(this.bufferView);
 		Dx.Release(this.buffer);
 		Dx.Release(this.swapChain);
-		Dx.Release(this.multithread);
 		Dx.Release(this.context);
 		this.layerResource = null;
 		this.layerView = null;
@@ -343,7 +340,6 @@ public sealed unsafe class Presenter: IDisposable
 		this.bufferView = null;
 		this.buffer = null;
 		this.swapChain = null;
-		this.multithread = null;
 		this.context = null;
 	}
 

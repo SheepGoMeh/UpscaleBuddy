@@ -15,6 +15,7 @@ namespace UpscaleBuddy.Game;
 public sealed unsafe class LayerBlend: IDisposable
 {
 	private ID3D11DeviceContext1* context1;
+	private ID3D11Multithread* multithread;
 	private ID3DDeviceContextState* state;
 	private ID3D11VertexShader* vertexShader;
 	private ID3D11PixelShader* pixelShader;
@@ -26,6 +27,8 @@ public sealed unsafe class LayerBlend: IDisposable
 		if (this.state == null)
 			this.CreateResources(context);
 
+		// DXVK does not lock SwapDeviceContextState. The lock must cover the full swap, draw and restore
+		this.multithread->Enter();
 		ID3DDeviceContextState* previous;
 		this.context1->SwapDeviceContextState(this.state, &previous);
 
@@ -45,6 +48,7 @@ public sealed unsafe class LayerBlend: IDisposable
 		context->OMSetRenderTargets(0, null, null);
 
 		this.context1->SwapDeviceContextState(previous, null);
+		this.multithread->Leave();
 		previous->Release();
 	}
 
@@ -55,6 +59,7 @@ public sealed unsafe class LayerBlend: IDisposable
 		try
 		{
 			this.context1 = Dx.Query<ID3D11DeviceContext1>(context);
+			this.multithread = Dx.Query<ID3D11Multithread>(context);
 			ID3D11Device1* device1 = Dx.Query<ID3D11Device1>(device);
 			D3D_FEATURE_LEVEL level = device->GetFeatureLevel();
 			ID3DDeviceContextState* created;
@@ -93,11 +98,13 @@ public sealed unsafe class LayerBlend: IDisposable
 		Dx.Release(this.pixelShader);
 		Dx.Release(this.vertexShader);
 		Dx.Release(this.state);
+		Dx.Release(this.multithread);
 		Dx.Release(this.context1);
 		this.blendState = null;
 		this.pixelShader = null;
 		this.vertexShader = null;
 		this.state = null;
+		this.multithread = null;
 		this.context1 = null;
 	}
 }

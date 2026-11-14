@@ -904,6 +904,9 @@ public unsafe class DlssPath: IDisposable
 			current.Dispatch(context, dispatch);
 			currentDownsampler?.Dispatch(context, dispatch.Output, current.UpscaleWidth, current.UpscaleHeight, gameOutput, this.OutputWidth,
 				this.OutputHeight);
+			if (currentDownsampler == null)
+				CopyOutputToColor(context, gameOutput, dispatch.Color);
+
 			if (dispatch.Measure)
 			{
 				double ms = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
@@ -947,6 +950,20 @@ public unsafe class DlssPath: IDisposable
 		}
 
 		return NgxParameters.Success;
+	}
+
+	/// <summary>
+	/// Render thread. After the upscale, the game's effects sample SceneInput (via RTM+0x100) as a full frame image.
+	/// </summary>
+	private static void CopyOutputToColor(ID3D11DeviceContext* context, ID3D11Texture2D* output, ID3D11Texture2D* color)
+	{
+		D3D11_TEXTURE2D_DESC outputDesc = Dx.GetDesc(output);
+		D3D11_TEXTURE2D_DESC colorDesc = Dx.GetDesc(color);
+		if (outputDesc.Format != colorDesc.Format || outputDesc.Width > colorDesc.Width || outputDesc.Height > colorDesc.Height)
+			return;
+
+		D3D11_BOX box = new() { right = outputDesc.Width, bottom = outputDesc.Height, back = 1 };
+		context->CopySubresourceRegion((ID3D11Resource*)color, 0, 0, 0, 0, (ID3D11Resource*)output, 0, &box);
 	}
 
 	/// <summary>

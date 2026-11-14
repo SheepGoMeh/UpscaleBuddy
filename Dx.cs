@@ -33,6 +33,21 @@ public static unsafe class Dx
 		return result;
 	}
 
+	/// <summary>COM identity. Two interface pointers to one object can be different. Their IUnknown pointers are equal</summary>
+	public static bool IsSameObject(void* a, void* b)
+	{
+		if (a == b)
+			return true;
+		if (a == null || b == null)
+			return false;
+
+		IUnknown* unknownA = Query<IUnknown>(a);
+		IUnknown* unknownB = Query<IUnknown>(b);
+		unknownA->Release();
+		unknownB->Release();
+		return unknownA == unknownB;
+	}
+
 	public static void Release<T>(T* obj) where T : unmanaged, IUnknown.Interface
 	{
 		if (obj != null)

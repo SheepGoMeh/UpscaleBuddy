@@ -221,7 +221,7 @@ public sealed unsafe class Presenter: IDisposable
 			ID3D11Texture2D* swapChainBuffer;
 			ThrowIfFailed(this.swapChain->GetBuffer(0, __uuidof<ID3D11Texture2D>(), (void**)&swapChainBuffer));
 			this.buffer = swapChainBuffer;
-			if ((void*)this.buffer != back->D3D11Texture2D)
+			if (!Dx.IsSameObject(this.buffer, back->D3D11Texture2D))
 				throw new InvalidOperationException("the back buffer's texture is not the swap chain's buffer");
 
 			ID3D11Device* d3dDevice;

@@ -37,7 +37,7 @@ public unsafe class EffectMask: IDisposable
 	private const string WeatherFinishSignature = "E8 ?? ?? ?? ?? 48 8D BB ?? ?? ?? ?? 4C 39 6F"; // From Manager.RenderView
 	private const string EffectsMaskEnabledSignature = "E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 4C 8B 35"; // From Manager.Render
 
-	private const int GameMaskOffset = 0x680; // RenderTargetManager: DepthOfFieldEffectMask, B8G8R8A8 at the render size
+	private const int GameMaskOffset = 0x680; // RenderTargetManager: DepthOfFieldEffectMask, B8G8R8A8, allocated at the display size
 
 	private const TextureFlags TargetFlags = TextureFlags.TextureRenderTarget | TextureFlags.ReadWrite | TextureFlags.UserManaged;
 	private const uint AllocationClass = 3;
@@ -219,8 +219,8 @@ public unsafe class EffectMask: IDisposable
 	}
 
 	/// <summary>
-	/// Main thread. Fits ours to the size of the game mask and recreates ours when that size changes. Returns false
-	/// when there is no mask
+	/// Main thread. Returns false when the game has no mask.
+	/// The plugin's mask has the allocated size of the game's targets. D3D11 binds only render targets of one size.
 	/// </summary>
 	private bool FitMask()
 	{
@@ -229,17 +229,17 @@ public unsafe class EffectMask: IDisposable
 			return false;
 
 		KernelTexture* current = this.Mask;
-		if (current != null && current->ActualWidth == game->ActualWidth && current->ActualHeight == game->ActualHeight)
+		if (current != null && current->AllocatedWidth == game->AllocatedWidth && current->AllocatedHeight == game->AllocatedHeight)
 			return true;
 
 		// The game releases it when the frames that use it are done
 		if (current != null)
 			current->DecRef();
-		current = KernelTexture.CreateTexture2D((int)game->ActualWidth, (int)game->ActualHeight, 1, TextureFormat.B8G8R8A8_UNORM, TargetFlags,
-			AllocationClass);
+		current = KernelTexture.CreateTexture2D((int)game->AllocatedWidth, (int)game->AllocatedHeight, 1, TextureFormat.B8G8R8A8_UNORM,
+			TargetFlags, AllocationClass);
 		this.mask = (nint)current;
 		if (current == null)
-			Service.PluginLog.Warning($"EffectMask target {game->ActualWidth}x{game->ActualHeight} couldn't be created");
+			Service.PluginLog.Warning($"EffectMask target {game->AllocatedWidth}x{game->AllocatedHeight} couldn't be created");
 		return current != null;
 	}
 

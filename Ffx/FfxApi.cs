@@ -69,10 +69,13 @@ public static unsafe class FfxApi
 
 	public static nint Message => Marshal.GetFunctionPointerForDelegate(MessageCallback);
 
+	/// <summary>When null, the DLLs are in the plugin's directory.</summary>
+	public static string? DllDirectory;
+
 	/// <summary>Loads the effect's DLL by full path, then loads the loader once.</summary>
 	public static void Load(string effectDll)
 	{
-		string directory = Service.PluginInterface.AssemblyLocation.DirectoryName!;
+		string directory = DllDirectory ?? Service.PluginInterface.AssemblyLocation.DirectoryName!;
 		NativeLibrary.Load(Path.Combine(directory, effectDll));
 		if (loader != 0)
 			return;

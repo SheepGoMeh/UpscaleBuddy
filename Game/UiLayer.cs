@@ -12,6 +12,8 @@ using FFXIVClientStructs.Interop;
 
 using TerraFX.Interop.DirectX;
 
+using UpscaleBuddy.D3D12;
+
 using static TerraFX.Interop.DirectX.D3D11_BLEND;
 using static TerraFX.Interop.DirectX.D3D11_BLEND_OP;
 using static TerraFX.Interop.Windows.Windows;
@@ -59,6 +61,11 @@ public unsafe class UiLayer: IDisposable
 	private const int GammaOffset = 0x98;
 	private const int ToneFlagOffset = 0x9C;
 	private const int ToneAmountOffset = 0xA0;
+
+	// These are PostEffectManager offsets. ToneAdjust reads the values as cToneMapParam {0, 0, strength, exponent}.
+	private const int ToneExponentOffset = 0x4678;
+	private const int ToneLutIndexOffset = 0x467C;
+	private const int ToneStrengthOffset = 0x4680;
 
 	// RenderTargetManager.Initialize creates its targets with these values: TextureRenderTarget | ReadWrite |
 	// UserManaged, allocation class 3.
@@ -239,9 +246,23 @@ public unsafe class UiLayer: IDisposable
 
 	private (uint, uint) failedSize;
 
+	public readonly record struct ToneSettings(bool Active, float Exponent, float Strength, int LutIndex);
+
+	/// <summary>Call on the main thread, after PostEffectManager.Prepare.</summary>
+	public static ToneSettings ToneParameters()
+	{
+		PostEffectManager* postEffects = PostEffectManager.Instance();
+		if (postEffects == null)
+			return default;
+
+		byte* fields = (byte*)postEffects;
+		return new ToneSettings((postEffects->Flags & PostEffectFlags.ToneAdjust) != 0 || InPlace(postEffects), *(float*)(fields + ToneExponentOffset),
+			*(float*)(fields + ToneStrengthOffset), *(int*)(fields + ToneLutIndexOffset));
+	}
+
 	/// <summary>
-	/// Main thread. Queues the frame's callbacks in view 31 around ToneAdjust. With frame generation, it also queues
-	/// ToneAdjust for the regenerated frame. When effects is true, the composite callback applies ReShade's effects.
+	/// Main thread. Queues the frame's callbacks in view 31 around ToneAdjust. With synchronous frame generation, it also
+	/// queues ToneAdjust for the regenerated frame. When effects is true, the composite callback applies ReShade's effects.
 	/// </summary>
 	private void QueueFrame(KernelTexture* target, KernelTexture* ui, bool generate, bool effects)
 	{
@@ -252,15 +273,16 @@ public unsafe class UiLayer: IDisposable
 			scene = this.Fit(ref this.scenes[this.sceneIndex], target->ActualWidth, target->ActualHeight);
 		}
 
+		bool async = generate && this.runner.Async;
 		PostEffectManager* postEffects = PostEffectManager.Instance();
-		bool toneAdjust = (postEffects->Flags & PostEffectFlags.ToneAdjust) != 0 || InPlace(postEffects);
+		ToneSettings tone = ToneParameters();
 		KernelTexture* backBuffer = Device.Instance()->SwapChain->BackBuffer;
 		KernelTexture* source = null;
 		KernelTexture* finished = null;
-		if (scene != null)
+		if (scene != null && !async)
 		{
 			source = this.Fit(ref this.regeneratedSource, target->ActualWidth, target->ActualHeight);
-			finished = toneAdjust ? this.Fit(ref this.regeneratedTarget, backBuffer->ActualWidth, backBuffer->ActualHeight) : source;
+			finished = tone.Active ? this.Fit(ref this.regeneratedTarget, backBuffer->ActualWidth, backBuffer->ActualHeight) : source;
 		}
 
 		this.regenerated = finished;
@@ -274,13 +296,17 @@ public unsafe class UiLayer: IDisposable
 		// The composite callback does not use SetDefaultState. SetDefaultState records the back buffer as bound but does
 		// not bind it, so ToneAdjust then skips its bind of the back buffer. ReShade restores the state that it changes
 		context->SortKey = top | BeforeToneAdjust;
-		this.QueueCallback(context, this.compositeFunction, false, (nint)target, (nint)ui, (nint)scene, effects ? 1 : 0);
+		this.QueueCallback(context, this.compositeFunction, false, [(nint)target, (nint)ui, (nint)scene, effects ? 1 : 0]);
 
 		// Frame generation libraries change state freely. The game resets its state cache around the callback, like
 		// for DLSS.
 		context->SortKey = top | AfterToneAdjust;
-		this.QueueCallback(context, this.regenerateFunction, generate, (nint)ui, (nint)scene, (nint)source, 0);
-		if (source != null && toneAdjust && finished != null)
+		this.QueueCallback(context, this.regenerateFunction, generate,
+		[
+			(nint)ui, (nint)scene, (nint)source, async ? 1 : 0, BitConverter.SingleToInt32Bits(tone.Exponent),
+			BitConverter.SingleToInt32Bits(tone.Strength), tone.LutIndex, tone.Active ? 1 : 0,
+		]);
+		if (source != null && tone.Active && finished != null)
 			this.QueueToneAdjust(postEffects, source, finished);
 
 		context->SortKey = sortKey;
@@ -291,17 +317,14 @@ public unsafe class UiLayer: IDisposable
 	/// When defaultState is true, ImmediateContextDX11.SetDefaultState runs before and after the callback. Use it for
 	/// callbacks that change state directly.
 	/// </summary>
-	private void QueueCallback(Context* context, nint function, bool defaultState, nint first, nint second, nint third, nint fourth)
+	private void QueueCallback(Context* context, nint function, bool defaultState, ReadOnlySpan<nint> values)
 	{
-		byte* command = (byte*)context->AllocateCommand((ulong)(CallbackSize + 4 * sizeof(nint)));
+		byte* command = (byte*)context->AllocateCommand((ulong)(CallbackSize + (values.Length * sizeof(nint))));
 		if (command == null)
 			return;
 
 		nint* arguments = (nint*)(command + CallbackSize);
-		arguments[0] = first;
-		arguments[1] = second;
-		arguments[2] = third;
-		arguments[3] = fourth;
+		values.CopyTo(new Span<nint>(arguments, values.Length));
 		*(uint*)command = CallbackCommandType;
 		*(nint*)(command + 0x8) = function;
 		*(nint*)(command + 0x10) = (nint)arguments;
@@ -447,8 +470,8 @@ public unsafe class UiLayer: IDisposable
 	}
 
 	/// <summary>
-	/// Render thread, after ToneAdjust. Draws the layer over the generated frame (or this frame's scene again) for the
-	/// regenerated frame's ToneAdjust. Clears the layer.
+	/// Runs on the render thread, after ToneAdjust. The arguments are ui, scene, source, async, exponent bits, strength
+	/// bits, LUT index and ToneAdjust active.
 	/// </summary>
 	private void Regenerate(nint* arguments)
 	{
@@ -459,7 +482,17 @@ public unsafe class UiLayer: IDisposable
 		KernelTexture* scene = (KernelTexture*)arguments[1];
 		KernelTexture* source = (KernelTexture*)arguments[2];
 		ID3D11DeviceContext* context = (ID3D11DeviceContext*)Device.Instance()->D3D11DeviceContext;
-		if (source != null && scene != null)
+		if (arguments[3] != 0 && scene != null)
+		{
+			FinishConstants finish = new()
+			{
+				Exponent = BitConverter.Int32BitsToSingle((int)arguments[4]),
+				Strength = BitConverter.Int32BitsToSingle((int)arguments[5]),
+				Flags = arguments[7] != 0 ? FinishConstants.ToneAdjust : 0,
+			};
+			this.runner.Submit(context, scene, ui, this.composited, finish, (int)arguments[6]);
+		}
+		else if (source != null && scene != null)
 		{
 			if (!this.runner.Generate(context, scene, source))
 				context->CopyResource((ID3D11Resource*)source->D3D11Texture2D, (ID3D11Resource*)scene->D3D11Texture2D);

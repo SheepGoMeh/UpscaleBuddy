@@ -185,6 +185,18 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		if (ImGui.IsItemHovered())
 			ImGui.SetTooltip("On: no tearing. Off: frames can appear a little sooner, but you can see tearing.");
 
+#if DEBUG
+		int queue = (int)configuration.FrameGenerationQueue;
+		if (ImGui.Combo("Frame generation queue", ref queue, "Auto\0Synchronous\0Compute\0"))
+		{
+			configuration.FrameGenerationQueue = (FrameGenerationQueue)queue;
+			configuration.Save();
+		}
+
+		if (ImGui.IsItemHovered())
+			ImGui.SetTooltip("Compute: the game doesn't wait for frame generation.\nSynchronous: the game waits for each generated frame.");
+#endif
+
 		// Each real frame waits half a rendered frame behind the generated one, plus about 1 ms of generation
 		int rendered = framePacer.GenerationRate;
 		if (rendered > 0)
@@ -212,5 +224,9 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		ImGui.TextDisabled(frameGeneration.Paused
 			? "Paused while you are AFK or the game window is in the background."
 			: frameGeneration.Status);
+		if (!frameGeneration.Paused && frameGeneration.SynchronousReason is { } reason)
+			ImGui.TextDisabled($"Synchronous: {reason}");
+		if (configuration.ShowTimings && frameGeneration.Async)
+			ImGui.TextDisabled($"Generation and finish on the D3D12 compute queue: {frameGeneration.AsyncQueueMs:F3} ms");
 	}
 }

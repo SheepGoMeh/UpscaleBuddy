@@ -10,6 +10,8 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
 
+using UpscaleBuddy.FrameGeneration;
+
 using static TerraFX.Interop.Windows.Windows;
 
 using Framework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
@@ -30,6 +32,7 @@ public unsafe class FramePacer: IDisposable
 
 	// A Present this long before a vblank is on screen at it
 	private static readonly long VBlankLead = Stopwatch.Frequency * 7 / 2000;
+	private static readonly long CarrierAfterVBlank = Stopwatch.Frequency / 5000;
 
 	private delegate void PresentDelegate(SwapChain* swapChain);
 
@@ -58,6 +61,7 @@ public unsafe class FramePacer: IDisposable
 	private int halfIndex;
 	private long tickStart;
 	private long deadline;
+	private bool carrierPhase;
 	private bool presented;
 
 	// Back buffer content for the second Present. The discard swap effect leaves the back buffer undefined.
@@ -172,6 +176,16 @@ public unsafe class FramePacer: IDisposable
 		bool threaded = generate && game && !this.stopping && this.presenter.Usable(swapChain);
 		if (!threaded)
 			this.presenter.Release();
+
+		bool asyncFrame = game && this.frameGeneration.Async;
+		GenerationTicket? ticket = game ? this.frameGeneration.TakeTicket() : null;
+		if (game && generate)
+			this.frameGeneration.UpdateMode(threaded);
+		if (!(threaded && asyncFrame) && ticket is { } unused)
+		{
+			unused.Owner.Release(unused);
+			ticket = null;
+		}
 		if (!generate && game)
 			this.uiLayer.DiscardRegenerated();
 		bool effects = game && this.reShade.TakeRendered();
@@ -194,8 +208,11 @@ public unsafe class FramePacer: IDisposable
 			this.workIndex = (this.workIndex + 1) % this.work.Length;
 		}
 
-		if (generate)
-			this.TrackHeadroom(this.deadline != 0 && now > this.deadline + VBlankLead);
+		bool missedVBlank = this.deadline != 0 && now > this.deadline + VBlankLead;
+		if (generate && threaded && asyncFrame)
+			this.TrackHeadroom(missedVBlank || ticket == null || this.presenter.TakeMissed() > 0);
+		else if (generate)
+			this.TrackHeadroom(missedVBlank);
 		else
 			this.ResetHeadroom();
 
@@ -203,8 +220,12 @@ public unsafe class FramePacer: IDisposable
 		// that case the second Present would go out right after the first in the same vblank. Then the generated
 		// frame would not show.
 		long behind = generate ? period / 2 : period;
-		if (this.deadline == 0 || now - this.deadline > behind)
-			this.deadline = this.AlignToVBlank(now);
+		bool carrierPhase = threaded && asyncFrame;
+		if (this.deadline == 0 || now - this.deadline > behind || carrierPhase != this.carrierPhase)
+			this.deadline = this.AlignToVBlank(now, carrierPhase ? CarrierAfterVBlank : -VBlankLead);
+		this.carrierPhase = carrierPhase;
+		if (carrierPhase)
+			this.presenter.ExpectCarrier(this.deadline);
 
 		this.timer.Wait(this.deadline);
 
@@ -212,7 +233,21 @@ public unsafe class FramePacer: IDisposable
 		uint syncInterval = this.configuration.FrameGenerationVsync ? 1u : 0u;
 		this.presentingSyncInterval = syncInterval;
 		long presentStart = Stopwatch.GetTimestamp();
-		if (threaded && this.presenter.Present(device, swapChain, this.deadline + period / 2, syncInterval, effects, this.presentWithoutLimit))
+		if (threaded && asyncFrame)
+		{
+			this.presentingSyncInterval = 0;
+			if (this.presenter.PresentAsync(device, swapChain, ticket, this.deadline, period, syncInterval, effects, this.presentWithoutLimit))
+			{
+				this.halves[this.halfIndex] = Math.Max(frameWork, this.presenter.GenerationLatency) / 2;
+				this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
+				this.deadline += period;
+				this.presented = true;
+				return;
+			}
+
+			this.presentingSyncInterval = syncInterval;
+		}
+		else if (threaded && this.presenter.Present(device, swapChain, this.deadline + period / 2, syncInterval, effects, this.presentWithoutLimit))
 		{
 			this.halves[this.halfIndex] = (frameWork + Stopwatch.GetTimestamp() - presentStart) / 2;
 			this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
@@ -283,13 +318,14 @@ public unsafe class FramePacer: IDisposable
 	/// Returns the first time at or after this one when a Present issued at that time reaches the screen at the next
 	/// vblank.
 	/// </summary>
-	private long AlignToVBlank(long time)
+	/// <summary>Returns the first vblank + offset that is at or after time.</summary>
+	private long AlignToVBlank(long time, long offset)
 	{
 		if (!this.ReadVBlank())
 			return time;
 
 		long next = this.vblank + ((time - this.vblank) / this.vblankPeriod + 1) * this.vblankPeriod;
-		long aligned = next - VBlankLead;
+		long aligned = next + offset;
 		return aligned >= time ? aligned : aligned + this.vblankPeriod;
 	}
 

@@ -26,6 +26,18 @@ public enum Upscaler
 	NvidiaDlss,
 }
 
+public enum FrameGenerationQueue
+{
+	// Uses the D3D12 compute queue when AsyncBlocker returns null.
+	Auto,
+
+	// The game's queue waits for each generation.
+	Synchronous,
+
+	// Uses the D3D12 compute queue when AsyncBlocker returns null.
+	Compute,
+}
+
 public class UpscaleBuddyConfiguration: IPluginConfiguration
 {
 	public int Version { get; set; }
@@ -53,6 +65,9 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 
 	// Frames shown per second with frame generation, 0 = the display's refresh rate
 	public int FrameGenerationTarget;
+
+	// Only Debug builds show this option
+	public FrameGenerationQueue FrameGenerationQueue = FrameGenerationQueue.Auto;
 
 	// Sync interval 1 for frame generation's Presents, else 0
 	public bool FrameGenerationVsync = true;

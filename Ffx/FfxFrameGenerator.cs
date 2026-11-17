@@ -121,12 +121,13 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 	// Created on the first frame, in the inputs' formats
 	private Twin? scene, output, depth, motionVectors;
 
-	public FfxFrameGenerator(ID3D11Device* device, uint width, uint height, uint maxRenderWidth, uint maxRenderHeight, bool infiniteFar)
+	/// <summary>The caller owns the bridge. The bridge must outlive the generator.</summary>
+	public FfxFrameGenerator(Bridge bridge, uint width, uint height, uint maxRenderWidth, uint maxRenderHeight, bool infiniteFar)
 	{
 		this.width = width;
 		this.height = height;
 		Load(FrameGenerationDll);
-		this.bridge = new Bridge(device);
+		this.bridge = bridge;
 		try
 		{
 			BackendDx12 backend = new() { Header = { Type = DescBackendDx12 }, Device = this.bridge.Device12 };
@@ -177,74 +178,75 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 		bool reset = inputs.Reset || this.first;
 		this.first = false;
 		ulong id = ++this.frameId;
-		Rect rect = new() { Width = (int)this.width, Height = (int)this.height };
-		nint current = this.context;
-		this.bridge.Execute(d3d11, list =>
-		{
-			ConfigureFrameGeneration configure = new()
-			{
-				Header = { Type = DescConfigureFrameGeneration },
-				FrameGenerationEnabled = 1,
-				Flags = DispatchNoSwapchain,
-				GenerationRect = rect,
-				FrameId = id,
-			};
-			Configure(current, &configure.Header, "ffxConfigure (frame generation)");
-
-			DispatchPrepareV2 prepare = new()
-			{
-				Header = { Type = DescDispatchPrepareV2 },
-				FrameId = id,
-				Flags = DispatchNoSwapchain,
-				CommandList = list,
-				RenderSize = new Dimensions { Width = frame.RenderWidth, Height = frame.RenderHeight },
-				JitterX = frame.JitterX,
-				JitterY = frame.JitterY,
-				MotionVectorScaleX = frame.MotionVectorScaleX,
-				MotionVectorScaleY = frame.MotionVectorScaleY,
-				FrameTimeDelta = frame.FrameTimeMs,
-				Reset = reset ? (byte)1 : (byte)0,
-				CameraNear = frame.CameraNear,
-				CameraFar = frame.CameraFar,
-				CameraFovAngleVertical = frame.CameraFovY,
-				ViewSpaceToMetersFactor = 1.0f,
-				Depth = Describe(depthTwin.Input),
-				MotionVectors = Describe(motionTwin.Input),
-				CameraPosition = frame.CameraPosition,
-				CameraUp = frame.CameraUp,
-				CameraRight = frame.CameraRight,
-				CameraForward = frame.CameraForward,
-			};
-			Dispatch(current, &prepare.Header, "ffxDispatch (frame generation prepare)");
-
-			DispatchFrameGeneration generate = new()
-			{
-				Header = { Type = DescDispatchFrameGeneration },
-				CommandList = list,
-				PresentColor = Describe(sceneTwin.Input),
-				Output0 = Describe(outputTwin.Input),
-				NumGeneratedFrames = 1,
-				Reset = reset ? (byte)1 : (byte)0,
-				BackbufferTransferFunction = TransferFunctionSrgb,
-				GenerationRect = rect,
-				FrameId = id,
-			};
-			Dispatch(current, &generate.Header, "ffxDispatch (frame generation)");
-		}, false);
+		GenerationResources resources = new(sceneTwin.Input, depthTwin.Input, motionTwin.Input, outputTwin.Input);
+		this.bridge.Execute(d3d11, list => this.Record(list, frame, resources, reset, id), false);
 
 		Bridge.Copy(d3d11, result, outputTwin.Texture11, outputTwin.Input);
 	}
 
+	public void Record(ID3D12GraphicsCommandList* list, in FrameInputs frame, in GenerationResources resources, bool reset, ulong frameId)
+	{
+		Rect rect = new() { Width = (int)this.width, Height = (int)this.height };
+		ConfigureFrameGeneration configure = new()
+		{
+			Header = { Type = DescConfigureFrameGeneration },
+			FrameGenerationEnabled = 1,
+			Flags = DispatchNoSwapchain,
+			GenerationRect = rect,
+			FrameId = frameId,
+		};
+		Configure(this.context, &configure.Header, "ffxConfigure (frame generation)");
+
+		DispatchPrepareV2 prepare = new()
+		{
+			Header = { Type = DescDispatchPrepareV2 },
+			FrameId = frameId,
+			Flags = DispatchNoSwapchain,
+			CommandList = list,
+			RenderSize = new Dimensions { Width = frame.RenderWidth, Height = frame.RenderHeight },
+			JitterX = frame.JitterX,
+			JitterY = frame.JitterY,
+			MotionVectorScaleX = frame.MotionVectorScaleX,
+			MotionVectorScaleY = frame.MotionVectorScaleY,
+			FrameTimeDelta = frame.FrameTimeMs,
+			Reset = reset ? (byte)1 : (byte)0,
+			CameraNear = frame.CameraNear,
+			CameraFar = frame.CameraFar,
+			CameraFovAngleVertical = frame.CameraFovY,
+			ViewSpaceToMetersFactor = 1.0f,
+			Depth = Describe(resources.Depth),
+			MotionVectors = Describe(resources.MotionVectors),
+			CameraPosition = frame.CameraPosition,
+			CameraUp = frame.CameraUp,
+			CameraRight = frame.CameraRight,
+			CameraForward = frame.CameraForward,
+		};
+		Dispatch(this.context, &prepare.Header, "ffxDispatch (frame generation prepare)");
+
+		DispatchFrameGeneration generate = new()
+		{
+			Header = { Type = DescDispatchFrameGeneration },
+			CommandList = list,
+			PresentColor = Describe(resources.Scene),
+			Output0 = Describe(resources.Output),
+			NumGeneratedFrames = 1,
+			Reset = reset ? (byte)1 : (byte)0,
+			BackbufferTransferFunction = TransferFunctionSrgb,
+			GenerationRect = rect,
+			FrameId = frameId,
+		};
+		Dispatch(this.context, &generate.Header, "ffxDispatch (frame generation)");
+	}
+
 	public void Dispose()
 	{
-		this.bridge?.WaitIdle();
+		this.bridge.WaitIdle();
 		Destroy(ref this.context);
 		Bridge.Release(this.scene);
 		Bridge.Release(this.output);
 		Bridge.Release(this.depth);
 		Bridge.Release(this.motionVectors);
 		this.scene = this.output = this.depth = this.motionVectors = null;
-		this.bridge?.Dispose();
 		GC.SuppressFinalize(this);
 	}
 }

@@ -634,7 +634,6 @@ public unsafe class DlssPath: IDisposable
 
 		// The basis comes from the view matrix columns. The sign of forward comes from where the camera looks.
 		// The code does not assume the handedness.
-		// ponytail: only FSR 4 frame generation (RX 9000) depends on these. They are unverified there.
 		Matrix4x4 view = renderCamera->ViewMatrix;
 		Vector3 position = renderCamera->Origin;
 		Vector3 forward = Vector3.Normalize(new Vector3(view.M13, view.M23, view.M33));

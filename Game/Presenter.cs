@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -6,6 +7,8 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
+
+using UpscaleBuddy.FrameGeneration;
 
 using static TerraFX.Interop.Windows.Windows;
 
@@ -77,6 +80,24 @@ public sealed unsafe class Presenter: IDisposable
 	private long realDue;
 	private uint syncInterval;
 	private bool effects;
+
+	// presentLock protects these fields.
+	private bool asyncFrame;
+	private GenerationTicket? ticket;
+	private long frameDue;
+	private long period;
+
+	// The back buffer of the last Present1 with capture, after ReShade's effects
+	private ID3D11Texture2D* lastShown;
+	private readonly DueTimeLearner learner = new();
+
+	// carrierAt is the value of the last ExpectCarrier. carrierDone is the due value of the last PresentAsync.
+	private static readonly long CarrierLead = Stopwatch.Frequency / 2000;
+	private static readonly long CarrierWindow = Stopwatch.Frequency * 5 / 2000;
+	private long carrierAt;
+	private long carrierDone;
+	private int missed;
+	private long latency;
 
 	public Presenter(UiLayer uiLayer, ReShadeEffects reShade)
 	{
@@ -160,6 +181,10 @@ public sealed unsafe class Presenter: IDisposable
 
 			this.frame++;
 			this.pending = true;
+			this.asyncFrame = false;
+			if (this.ticket is { } stale)
+				stale.Owner.Release(stale);
+			this.ticket = null;
 			this.realDue = realAt;
 			this.syncInterval = syncInterval;
 			this.effects = frameEffects;
@@ -169,10 +194,52 @@ public sealed unsafe class Presenter: IDisposable
 		return true;
 	}
 
-	/// <summary>Requires presentLock</summary>
-	private void PresentGenerated(bool frameEffects, Action present)
+	/// <summary>The render thread must be idle. The presenter releases frameTicket.</summary>
+	/// <returns>False when the presenter cannot start</returns>
+	public bool PresentAsync(Device* device, SwapChain* kernelSwapChain, GenerationTicket? frameTicket, long due, long framePeriod, uint frameSyncInterval,
+		bool frameEffects, Action carrierPresent)
 	{
-		if (this.layerDrawn)
+		if (!this.Active && !this.Start(device, kernelSwapChain))
+		{
+			if (frameTicket is { } unused)
+				unused.Owner.Release(unused);
+			return false;
+		}
+
+		lock (this.presentLock)
+		{
+			this.context->CopyResource((ID3D11Resource*)this.real, (ID3D11Resource*)this.ours);
+			// lastShown already contains the layer.
+			this.context->CopyResource((ID3D11Resource*)this.buffer, (ID3D11Resource*)this.lastShown);
+			this.PresentGenerated(true, carrierPresent, false);
+
+			if (this.ticket is { } stale)
+				stale.Owner.Release(stale);
+			this.ticket = frameTicket;
+			this.asyncFrame = true;
+			this.frameDue = due;
+			this.period = framePeriod;
+			this.frame++;
+			this.pending = true;
+			this.syncInterval = frameSyncInterval;
+			this.effects = frameEffects;
+		}
+
+		Volatile.Write(ref this.carrierDone, due);
+		SetEvent(this.work);
+		return true;
+	}
+
+	/// <summary>Returns the number of tickets that did not get a Present1 since the last call.</summary>
+	public int TakeMissed() => Interlocked.Exchange(ref this.missed, 0);
+
+	/// <summary>The time from the due value to the completion of the last ticket, in Stopwatch ticks.</summary>
+	public long GenerationLatency => Interlocked.Read(ref this.latency);
+
+	/// <summary>Requires presentLock</summary>
+	private void PresentGenerated(bool frameEffects, Action present, bool blendLayer = true)
+	{
+		if (this.layerDrawn && blendLayer)
 			this.blend.Draw(this.context, this.bufferView, this.width, this.height, this.layerResource, true);
 
 		float* transparent = stackalloc float[4] { 0, 0, 0, 0 };
@@ -209,6 +276,11 @@ public sealed unsafe class Presenter: IDisposable
 			{
 				long current;
 				long due;
+				bool async;
+				GenerationTicket? frameTicket;
+				long frameStart;
+				long framePeriod;
+				bool yield;
 				lock (this.presentLock)
 				{
 					if (!this.pending)
@@ -216,38 +288,153 @@ public sealed unsafe class Presenter: IDisposable
 
 					current = this.frame;
 					due = this.realDue;
+					async = this.asyncFrame;
+					frameTicket = this.ticket;
+					this.ticket = null;
+					frameStart = this.frameDue;
+					framePeriod = this.period;
+					yield = async && this.syncInterval != 0;
+				}
+
+				if (async)
+				{
+					long? generatedDue = this.ShowGeneratedWhenReady(current, frameTicket, frameStart, framePeriod, yield);
+					if (generatedDue == null)
+						return;
+
+					due = generatedDue.Value + (framePeriod / 2);
+				}
+				else if (frameTicket is { } unused)
+				{
+					unused.Owner.Release(unused);
 				}
 
 				if (!this.timer.Wait(due, this.stop))
 					return;
 
+				if (yield)
+					this.YieldToCarrier();
 				lock (this.presentLock)
 				{
 					if (!this.running || this.frame != current)
 						continue;
 
 					this.pending = false;
-					this.ShowReal();
+					this.ShowReal(async);
 				}
 			}
 		}
 	}
 
-	/// <summary>Requires presentLock. Present1 must not hold the device lock (see ReShadeEffects.PresentLock)</summary>
-	private void ShowReal()
+	/// <summary>Releases frameTicket. Returns the generated frame's due time, or null when stop is signalled.</summary>
+	private long? ShowGeneratedWhenReady(long current, GenerationTicket? frameTicket, long frameStart, long framePeriod, bool yield)
 	{
-		DXGI_PRESENT_PARAMETERS parameters = default;
+		long lag = (long)(this.learner.LagMs(framePeriod * 1000.0 / Stopwatch.Frequency) * Stopwatch.Frequency / 1000);
+		long generatedDue = frameStart + lag;
+		bool shown = false;
+		try
+		{
+			if (frameTicket is not { } taken)
+				return generatedDue;
+
+			if (Behind(Stopwatch.GetTimestamp(), generatedDue, framePeriod))
+				return generatedDue;
+
+			if (!this.timer.Wait(frameStart, this.stop))
+				return null;
+
+			long bound = generatedDue + (framePeriod / 4);
+			long remaining = Math.Max(0, bound - Stopwatch.GetTimestamp());
+			bool ready = taken.Owner.Wait(taken, (uint)(remaining * 1000 / Stopwatch.Frequency));
+			long offset = ready ? Math.Max(0, Stopwatch.GetTimestamp() - frameStart) : bound - frameStart;
+			this.learner.Add(offset * 1000.0 / Stopwatch.Frequency);
+			Interlocked.Exchange(ref this.latency, offset);
+			if (!ready || !taken.Owner.Usable(taken))
+				return generatedDue;
+
+			if (!this.timer.Wait(generatedDue, this.stop))
+				return null;
+
+			if (yield)
+				this.YieldToCarrier();
+			lock (this.presentLock)
+			{
+				if (this.running && this.frame == current)
+					shown = this.ShowGenerated(taken.Owner.Finished(taken));
+			}
+
+			return generatedDue;
+		}
+		finally
+		{
+			if (frameTicket is { } done)
+				done.Owner.Release(done);
+			if (!shown)
+				Interlocked.Increment(ref this.missed);
+		}
+	}
+
+	/// <summary>Call on the main thread before PresentAsync, with the same due value.</summary>
+	public void ExpectCarrier(long at) => Volatile.Write(ref this.carrierAt, at);
+
+	/// <summary>Call without presentLock. Present1 with sync interval 1 holds presentLock until a vblank.</summary>
+	private void YieldToCarrier()
+	{
+		long due = Volatile.Read(ref this.carrierAt);
+		while (this.running && CarrierPending(Stopwatch.GetTimestamp(), due, Volatile.Read(ref this.carrierDone), CarrierLead, CarrierWindow))
+			Thread.Sleep(0);
+	}
+
+	internal static bool CarrierPending(long now, long due, long done, long lead, long window) =>
+		done != due && now >= due - lead && now < due + window;
+
+	internal static bool Behind(long now, long generatedDue, long framePeriod) => now - generatedDue > framePeriod / 4;
+
+	/// <summary>Requires presentLock. Returns false when finished and the back buffer differ in size.</summary>
+	private bool ShowGenerated(ID3D11Texture2D* finished)
+	{
+		D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(finished);
+		if (desc.Width != this.width || desc.Height != this.height)
+			return false;
+
+		this.context->CopyResource((ID3D11Resource*)this.buffer, (ID3D11Resource*)finished);
+		if (this.layerDrawn)
+			this.blend.Draw(this.context, this.bufferView, this.width, this.height, this.layerResource, true);
+		this.Present1(true);
+		return true;
+	}
+
+	/// <summary>Requires presentLock</summary>
+	private void ShowReal(bool capture)
+	{
 		this.context->CopyResource((ID3D11Resource*)this.buffer, (ID3D11Resource*)this.real);
 		if (this.layerDrawn)
 			this.blend.Draw(this.context, this.bufferView, this.width, this.height, this.layerResource, true);
+		this.Present1(capture);
+	}
 
+	/// <summary>
+	/// Requires presentLock. Present1 must not hold the device lock (see ReShadeEffects.PresentLock). When capture is
+	/// true, lastShown receives the back buffer after ReShade's effects.
+	/// </summary>
+	private void Present1(bool capture)
+	{
+		DXGI_PRESENT_PARAMETERS parameters = default;
 		int result;
 		lock (this.reShade.PresentLock)
 		{
 			if (this.effects)
 				this.reShade.SkipNextPresent();
 
+			bool reShadeCapture = capture && this.reShade.HasRuntime;
+			if (reShadeCapture)
+				this.reShade.ArmCapture(this.context, this.buffer, this.lastShown);
+			else if (capture)
+				this.context->CopyResource((ID3D11Resource*)this.lastShown, (ID3D11Resource*)this.buffer);
+
 			result = this.swapChain->Present1(this.syncInterval, 0, &parameters);
+			if (reShadeCapture)
+				this.reShade.Disarm();
 		}
 
 		if (result is DeviceRemoved or DeviceReset)
@@ -297,6 +484,7 @@ public sealed unsafe class Presenter: IDisposable
 				this.oursView = CreateView(d3dDevice, this.ours);
 				this.bufferView = CreateView(d3dDevice, this.buffer);
 				this.real = Dx.CreateTexture(d3dDevice, desc.Width, desc.Height, desc.Format, 1, target);
+				this.lastShown = Dx.CreateTexture(d3dDevice, desc.Width, desc.Height, desc.Format, 1, target);
 				this.layer = Dx.CreateTexture(d3dDevice, desc.Width, desc.Height, desc.Format, 1, targetAndResource);
 				this.layerView = CreateView(d3dDevice, this.layer);
 				this.layerResource = Dx.CreateSrv(d3dDevice, this.layer);
@@ -307,6 +495,7 @@ public sealed unsafe class Presenter: IDisposable
 			}
 
 			this.context->CopyResource((ID3D11Resource*)this.ours, (ID3D11Resource*)this.buffer);
+			this.context->CopyResource((ID3D11Resource*)this.lastShown, (ID3D11Resource*)this.buffer);
 			this.originalTexture = back->D3D11Texture2D;
 			this.originalView = back->MipRenderTargets[0].D3D11RenderTargetViewOrDepthStencilView;
 			back->D3D11Texture2D = this.ours;
@@ -359,6 +548,9 @@ public sealed unsafe class Presenter: IDisposable
 		SetEvent(this.stop);
 		this.thread?.Join();
 		this.thread = null;
+		if (this.ticket is { } held)
+			held.Owner.Release(held);
+		this.ticket = null;
 		this.overlay.Disarm();
 		if (this.backBuffer != null)
 		{
@@ -378,6 +570,7 @@ public sealed unsafe class Presenter: IDisposable
 		Dx.Release(this.layerView);
 		Dx.Release(this.layer);
 		Dx.Release(this.real);
+		Dx.Release(this.lastShown);
 		Dx.Release(this.oursView);
 		Dx.Release(this.ours);
 		Dx.Release(this.bufferView);
@@ -388,6 +581,7 @@ public sealed unsafe class Presenter: IDisposable
 		this.layerView = null;
 		this.layer = null;
 		this.real = null;
+		this.lastShown = null;
 		this.oursView = null;
 		this.ours = null;
 		this.bufferView = null;

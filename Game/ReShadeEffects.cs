@@ -207,18 +207,58 @@ public unsafe class ReShadeEffects: IDisposable
 		return this.srgbView;
 	}
 
+	/// <summary>When this is false, an armed capture does not copy.</summary>
+	public bool HasRuntime => this.runtime != 0;
+
 	/// <summary>
-	/// ReShade calls this at the Present of each runtime, Dalamud's viewports included. Keeps the game window's runtime
+	/// Call on the presenting thread, before Present1. The copy runs in reshade_present of that Present1, after the
+	/// effects. Call Disarm after Present1.
+	/// </summary>
+	public void ArmCapture(ID3D11DeviceContext* context, ID3D11Texture2D* source, ID3D11Texture2D* destination)
+	{
+		this.captureContext = context;
+		this.captureSource = source;
+		this.captureDestination = destination;
+		this.captured = false;
+		this.captureArmed = true;
+	}
+
+	/// <summary>Returns true when the copy ran.</summary>
+	public bool Disarm()
+	{
+		this.captureArmed = false;
+		return this.captured;
+	}
+
+	// Only the presenting thread uses these fields.
+	private ID3D11DeviceContext* captureContext;
+	private ID3D11Texture2D* captureSource;
+	private ID3D11Texture2D* captureDestination;
+	private bool captureArmed;
+	private bool captured;
+
+	/// <summary>
+	/// ReShade calls this after its effects, at the Present of each runtime. Dalamud's viewports have runtimes too. This
+	/// method keeps the runtime of the game window.
 	/// </summary>
 	private void OnPresent(nint current)
 	{
-		if (current == this.runtime)
-			return;
+		if (current != this.runtime)
+		{
+			nint hwnd = ((delegate* unmanaged<nint, nint>)(*(nint**)current)[GetHwndSlot])(current);
+			Device* device = Device.Instance();
+			if (device == null || hwnd != (nint)device->hWnd)
+				return;
 
-		nint hwnd = ((delegate* unmanaged<nint, nint>)(*(nint**)current)[GetHwndSlot])(current);
-		Device* device = Device.Instance();
-		if (device != null && hwnd == (nint)device->hWnd)
 			this.runtime = current;
+		}
+
+		if (this.captureArmed)
+		{
+			this.captureContext->CopyResource((ID3D11Resource*)this.captureDestination, (ID3D11Resource*)this.captureSource);
+			this.captured = true;
+			this.captureArmed = false;
+		}
 	}
 
 	private void OnDestroy(nint current)

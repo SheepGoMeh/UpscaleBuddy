@@ -6,7 +6,9 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 
+using UpscaleBuddy.FrameGeneration;
 using UpscaleBuddy.Game;
+using UpscaleBuddy.Ngx;
 using UpscaleBuddy.Windows;
 
 namespace UpscaleBuddy;
@@ -36,6 +38,7 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		this.effectMask = new EffectMask();
 		this.dlssPath = new DlssPath(this.configuration, this.effectMask);
 		this.frameGeneration = new FrameGenerationRunner(this.configuration, this.dlssPath);
+		NgxSession.Log = FrameGenerators.Log = message => Service.PluginLog.Information(message);
 		this.reShade = new ReShadeEffects(this.configuration);
 		this.uiLayer = new UiLayer(this.configuration, this.frameGeneration, this.reShade);
 		this.framePacer = new FramePacer(this.configuration, this.uiLayer, this.frameGeneration, this.reShade);

@@ -7,13 +7,26 @@ using FFXIVClientStructs.FFXIV.Client.UI;
 using TerraFX.Interop.DirectX;
 
 using UpscaleBuddy.D3D12;
-using UpscaleBuddy.Ffx;
 using UpscaleBuddy.FrameGeneration;
+using UpscaleBuddy.Ngx;
 
 using Device = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device;
 using KernelTexture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 
 namespace UpscaleBuddy.Game;
+
+/// <summary>The response of the runner to a generator failure</summary>
+internal enum FailureAction
+{
+	// Sets asyncFailed for async generation, failed for sync generation
+	Stop,
+
+	// Calls RuleOutNvidia. The generation mode does not change.
+	SwitchToAmd,
+
+	// For a lost device: calls RuleOutNvidia with closeSession, then Stop
+	SwitchToAmdAndStop,
+}
 
 /// <summary>
 /// Render thread. Runs the generator for the current sizes with the upscaler's inputs of the same frame. When a
@@ -25,6 +38,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	private Bridge? bridge;
 	private IFrameGenerator? generator;
 	private uint width, height, maxRenderWidth, maxRenderHeight;
+	private DlssFrameGenerationModel model;
 	private bool failed;
 	private int skipped;
 
@@ -42,6 +56,14 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	private volatile bool asyncFailed;
 
 	public string Status { get; private set; } = "Off";
+
+	/// <summary>True while the active generator is NVIDIA DLSS frame generation</summary>
+	public bool NvidiaActive => this.generator is NvidiaFrameGenerator || this.asyncGenerator?.IsNvidia == true;
+
+	private GeneratorShape Shape => new(this.width, this.height, this.maxRenderWidth, this.maxRenderHeight, this.model);
+
+	/// <summary>NGX writes its log files here</summary>
+	private static string NgxDataPath => Service.PluginInterface.GetPluginConfigDirectory();
 
 	/// <summary>UpdateMode sets this value. It is null when Async is true.</summary>
 	public string? SynchronousReason { get; private set; }
@@ -118,9 +140,63 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 		}
 		catch (Exception e)
 		{
-			this.Fail(e);
+			switch (ActionAfterFailure(e, this.bridge?.DeviceLost == true, this.generator is NvidiaFrameGenerator))
+			{
+				case FailureAction.SwitchToAmd:
+					this.RuleOutNvidia(e.Message, false);
+					Service.PluginLog.Warning(e, "DLSS frame generation failed, AMD frame generation from now on");
+					break;
+				case FailureAction.SwitchToAmdAndStop:
+					this.RuleOutNvidia(e.Message, true);
+					this.Fail(e);
+					break;
+				default:
+					this.Fail(e);
+					break;
+			}
+
 			return false;
 		}
+	}
+
+	/// <summary>True when e or one of its inner exceptions is an NGX failure</summary>
+	internal static bool IsNgxFailure(Exception? e)
+	{
+		for (; e != null; e = e.InnerException)
+		{
+			if (e is NgxException)
+				return true;
+		}
+
+		return false;
+	}
+
+	internal static FailureAction ActionAfterFailure(Exception? failure, bool deviceLost, bool nvidiaActive)
+	{
+		if (!nvidiaActive)
+			return FailureAction.Stop;
+		if (deviceLost)
+			return FailureAction.SwitchToAmdAndStop;
+		return IsNgxFailure(failure) ? FailureAction.SwitchToAmd : FailureAction.Stop;
+	}
+
+	internal static bool NeedsRecreate(bool exists, GeneratorShape current, GeneratorShape wanted) => !exists || current != wanted;
+
+	/// <summary>Releases the generators and stops the use of NVIDIA frame generation. closeSession also closes the NGX session.</summary>
+	private void RuleOutNvidia(string reason, bool closeSession)
+	{
+		this.Release("Switching to AMD frame generation");
+		this.ReleaseAsyncGenerator();
+		if (closeSession)
+			NgxSession.Shutdown();
+		FrameGenerators.RuleOutNvidia(reason);
+	}
+
+	private void StopAsync(Exception? failure, bool deviceLost)
+	{
+		this.asyncFailed = true;
+		this.Status = "Async generation failed, synchronous from now on";
+		Service.PluginLog.Error(failure, deviceLost ? "The D3D12 device was removed" : "Async frame generation failed");
 	}
 
 	/// <summary>Returns null when nothing was queued. TakeTicket returns the ticket.</summary>
@@ -153,9 +229,23 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 			{
 				if (ticket is { } unused)
 					unused.Owner.Release(unused);
-				this.asyncFailed = true;
-				this.Status = "Async generation failed, synchronous from now on";
-				Service.PluginLog.Error(generator.Failure, generator.DeviceLost ? "The D3D12 device was removed" : "Async frame generation failed");
+				bool deviceLost = generator.DeviceLost;
+				Exception? failure = generator.Failure;
+				switch (ActionAfterFailure(failure, deviceLost, generator.IsNvidia))
+				{
+					case FailureAction.SwitchToAmd:
+						this.RuleOutNvidia(failure!.Message, false);
+						Service.PluginLog.Warning(failure, "DLSS frame generation failed, AMD frame generation from now on");
+						break;
+					case FailureAction.SwitchToAmdAndStop:
+						this.RuleOutNvidia("the D3D12 device was removed", true);
+						this.StopAsync(failure, deviceLost);
+						break;
+					default:
+						this.StopAsync(failure, deviceLost);
+						break;
+				}
+
 				return null;
 			}
 
@@ -225,8 +315,8 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	private void Fit(ID3D11DeviceContext* context, uint sceneWidth, uint sceneHeight, in FrameInputs inputs)
 	{
 		D3D11_TEXTURE2D_DESC depth = Dx.GetDesc(inputs.Depth);
-		if (this.generator != null && sceneWidth == this.width && sceneHeight == this.height &&
-		    depth.Width == this.maxRenderWidth && depth.Height == this.maxRenderHeight)
+		GeneratorShape wanted = new(sceneWidth, sceneHeight, depth.Width, depth.Height, configuration.DlssFrameGenerationModel);
+		if (!NeedsRecreate(this.generator != null, this.Shape, wanted))
 			return;
 
 		this.Release("Starting");
@@ -235,7 +325,9 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 		try
 		{
 			this.bridge = new Bridge(device);
-			this.generator = new FfxFrameGenerator(this.bridge, sceneWidth, sceneHeight, depth.Width, depth.Height, inputs.InfiniteFar);
+			this.generator = FrameGenerators.Create(this.bridge, sceneWidth, sceneHeight, depth.Width, depth.Height, inputs.InfiniteFar,
+				wanted.Model, NgxDataPath);
+			this.model = wanted.Model;
 			this.width = sceneWidth;
 			this.height = sceneHeight;
 			this.maxRenderWidth = depth.Width;
@@ -251,8 +343,8 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	private bool FitAsync(ID3D11DeviceContext* context, uint sceneWidth, uint sceneHeight, in FrameInputs inputs)
 	{
 		D3D11_TEXTURE2D_DESC depth = Dx.GetDesc(inputs.Depth);
-		if (this.asyncGenerator != null && sceneWidth == this.width && sceneHeight == this.height &&
-		    depth.Width == this.maxRenderWidth && depth.Height == this.maxRenderHeight)
+		GeneratorShape wanted = new(sceneWidth, sceneHeight, depth.Width, depth.Height, configuration.DlssFrameGenerationModel);
+		if (!NeedsRecreate(this.asyncGenerator != null, this.Shape, wanted))
 			return true;
 
 		this.ReleaseAsyncGenerator();
@@ -282,7 +374,8 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 				return false;
 
 			this.asyncGenerator = new AsyncGenerator(this.asyncBridge, this.calibration, this.luts, sceneWidth, sceneHeight, depth.Width, depth.Height,
-				inputs.InfiniteFar);
+				inputs.InfiniteFar, wanted.Model, NgxDataPath);
+			this.model = wanted.Model;
 			this.width = sceneWidth;
 			this.height = sceneHeight;
 			this.maxRenderWidth = depth.Width;
@@ -338,6 +431,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	{
 		this.Release("Off");
 		this.ReleaseAsync();
+		NgxSession.Shutdown();
 		GC.SuppressFinalize(this);
 	}
 }

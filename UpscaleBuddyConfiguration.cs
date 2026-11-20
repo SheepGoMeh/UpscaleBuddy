@@ -38,6 +38,14 @@ public enum FrameGenerationQueue
 	Compute,
 }
 
+public enum DlssFrameGenerationModel
+{
+	Default,
+
+	// NVIDIA's Preset C: DLSSG.LiteCandidateBlendingEnabled, a lighter blending step
+	Performance,
+}
+
 public class UpscaleBuddyConfiguration: IPluginConfiguration
 {
 	public int Version { get; set; }
@@ -71,6 +79,9 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 
 	// Sync interval 1 for frame generation's Presents, else 0
 	public bool FrameGenerationVsync = true;
+
+	// The model of DLSS frame generation, a create-time value
+	public DlssFrameGenerationModel DlssFrameGenerationModel = DlssFrameGenerationModel.Default;
 
 	// Applies ReShade's effects to the scene before the UI, not to the finished frame (Game/ReShadeEffects)
 	public bool ReShadeBeforeUi;

@@ -5,8 +5,8 @@ using System.Threading;
 using TerraFX.Interop.DirectX;
 
 using UpscaleBuddy.D3D12;
-using UpscaleBuddy.Ffx;
 using UpscaleBuddy.Game;
+using UpscaleBuddy.Ngx;
 
 using static TerraFX.Interop.DirectX.DXGI_FORMAT;
 using static TerraFX.Interop.Windows.Windows;
@@ -49,7 +49,7 @@ public sealed unsafe class AsyncGenerator: IDisposable
 
 	/// <summary>The caller owns bridge, calibration and luts. They must outlive this generator.</summary>
 	public AsyncGenerator(Bridge bridge, FinishCalibrationResult calibration, ColorFilterLuts luts, uint width, uint height, uint maxRenderWidth,
-		uint maxRenderHeight, bool infiniteFar)
+		uint maxRenderHeight, bool infiniteFar, DlssFrameGenerationModel model, string ngxDataPath)
 	{
 		this.bridge = bridge;
 		this.calibration = calibration;
@@ -61,7 +61,7 @@ public sealed unsafe class AsyncGenerator: IDisposable
 		this.finish = new FinishPass(bridge.Device12, Slots);
 		try
 		{
-			this.generator = new FfxFrameGenerator(bridge, width, height, maxRenderWidth, maxRenderHeight, infiniteFar);
+			this.generator = FrameGenerators.Create(bridge, width, height, maxRenderWidth, maxRenderHeight, infiniteFar, model, ngxDataPath);
 		}
 		catch
 		{
@@ -74,6 +74,8 @@ public sealed unsafe class AsyncGenerator: IDisposable
 	}
 
 	public string Name => this.generator.Name;
+
+	public bool IsNvidia => this.generator is NvidiaFrameGenerator;
 
 	/// <summary>When this is true, Submit returns null.</summary>
 	public bool Failed => this.failure != null;

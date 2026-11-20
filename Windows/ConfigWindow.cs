@@ -185,6 +185,21 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		if (ImGui.IsItemHovered())
 			ImGui.SetTooltip("On: no tearing. Off: frames can appear a little sooner, but you can see tearing.");
 
+		if (frameGeneration.NvidiaActive)
+		{
+			int model = (int)configuration.DlssFrameGenerationModel;
+			if (ImGui.Combo("DLSS frame generation model", ref model, "Default\0Performance\0"))
+			{
+				configuration.DlssFrameGenerationModel = (DlssFrameGenerationModel)model;
+				configuration.Save();
+			}
+
+			if (ImGui.IsItemHovered())
+				ImGui.SetTooltip(
+					"Performance is NVIDIA's Preset C: a lighter blending step, faster, slightly lower quality.\n" +
+					"An NVIDIA app override for the game takes priority.");
+		}
+
 #if DEBUG
 		int queue = (int)configuration.FrameGenerationQueue;
 		if (ImGui.Combo("Frame generation queue", ref queue, "Auto\0Synchronous\0Compute\0"))

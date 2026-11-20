@@ -60,8 +60,11 @@ jobs:
           curl -sSfL https://goatcorp.github.io/dalamud-distrib/latest.zip -o dalamud.zip
           unzip -q dalamud.zip -d "$DALAMUD_HOME"
 
+      # A tag vX.Y.Z.W-testing builds version X.Y.Z.W and publishes a prerelease
       - name: Build
-        run: dotnet build -c Release -p:EnableWindowsTargeting=true -p:AssemblyVersion=${GITHUB_REF_NAME#v}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dotnet build -c Release -p:EnableWindowsTargeting=true -p:AssemblyVersion=${version%-testing}
 
       - name: Generate repo.json
         run: |
@@ -76,3 +79,5 @@ jobs:
             bin/Release/UpscaleBuddy/latest.zip
             repo.json
           generate_release_notes: true
+          prerelease: ${{ endsWith(github.ref_name, '-testing') }}
+          make_latest: ${{ !endsWith(github.ref_name, '-testing') }}

@@ -34,6 +34,10 @@ public unsafe class FramePacer: IDisposable
 	private static readonly long VBlankLead = Stopwatch.Frequency * 7 / 2000;
 	private static readonly long CarrierAfterVBlank = Stopwatch.Frequency / 5000;
 
+	// Sync interval 0 flips at once. A Present this long after the vblank start flips inside the vblank, where the tear
+	// is off screen. The margin covers the timer's wake error.
+	private static readonly long FlipAfterVBlank = Stopwatch.Frequency / 50000;
+
 	private delegate void PresentDelegate(SwapChain* swapChain);
 
 	private readonly UpscaleBuddyConfiguration configuration;
@@ -61,15 +65,16 @@ public unsafe class FramePacer: IDisposable
 	private int halfIndex;
 	private long tickStart;
 	private long deadline;
-	private bool carrierPhase;
+	private long deadlineOffset;
 	private bool presented;
 
 	// Back buffer content for the second Present. The discard swap effect leaves the back buffer undefined.
 	private ID3D11Texture2D* held;
 
-	// DWM's vblank grid. The pacer reads it when it aligns the schedule.
-	private long vblank;
-	private long vblankPeriod;
+	// The scan-out of the game window's monitor at scanOutRefresh. Null when the display does not report it.
+	private ScanOut? scanOut;
+	private HMONITOR scanOutMonitor;
+	private int scanOutRefresh;
 
 	// Frame generation headroom: which of the last frames' first Present missed its vblank
 	private readonly bool[] late = new bool[120];
@@ -200,7 +205,11 @@ public unsafe class FramePacer: IDisposable
 		}
 
 		long now = Stopwatch.GetTimestamp();
-		long period = Stopwatch.Frequency / rate;
+		ScanOut? vblanks = this.ScanOutFor(device);
+		int refreshes = vblanks != null ? RefreshesPerFrame(vblanks, rate) : 0;
+		ScanOut? grid = refreshes > 0 ? vblanks : null;
+		long period = grid != null ? (long)Math.Round(refreshes * grid.Period) : Stopwatch.Frequency / rate;
+		uint syncInterval = this.configuration.FrameGenerationVsync ? 1u : 0u;
 		long frameWork = this.tickStart != 0 ? now - this.tickStart : 0;
 		if (this.tickStart != 0)
 		{
@@ -218,25 +227,31 @@ public unsafe class FramePacer: IDisposable
 
 		// Align again on the first frame, or when the pacer is behind by more than the second Present's slot. In
 		// that case the second Present would go out right after the first in the same vblank. Then the generated
-		// frame would not show.
+		// frame would not show. On a refresh grid, every frame snaps to the nearest vblank, because the reported refresh
+		// period can be the nominal one.
 		long behind = generate ? period / 2 : period;
 		bool carrierPhase = threaded && asyncFrame;
-		if (this.deadline == 0 || now - this.deadline > behind || carrierPhase != this.carrierPhase)
-			this.deadline = this.AlignToVBlank(now, carrierPhase ? CarrierAfterVBlank : -VBlankLead);
-		this.carrierPhase = carrierPhase;
+		long offset = carrierPhase ? CarrierAfterVBlank : generate && syncInterval == 0 ? FlipAfterVBlank : -VBlankLead;
+		if (this.deadline == 0 || now - this.deadline > behind || offset != this.deadlineOffset)
+			this.deadline = AlignToVBlank(vblanks, now, offset);
+		else if (grid != null)
+			this.deadline = SnapToVBlank(grid, this.deadline, offset);
+		this.deadlineOffset = offset;
 		if (carrierPhase)
 			this.presenter.ExpectCarrier(this.deadline);
 
 		this.timer.Wait(this.deadline);
 
 		this.presenting = swapChain;
-		uint syncInterval = this.configuration.FrameGenerationVsync ? 1u : 0u;
 		this.presentingSyncInterval = syncInterval;
 		long presentStart = Stopwatch.GetTimestamp();
 		if (threaded && asyncFrame)
 		{
 			this.presentingSyncInterval = 0;
-			if (this.presenter.PresentAsync(device, swapChain, ticket, this.deadline, period, syncInterval, effects, this.presentWithoutLimit))
+			VBlankGrid? flipGrid = syncInterval == 0 && grid != null
+				? new VBlankGrid(this.deadline - CarrierAfterVBlank + FlipAfterVBlank, grid.Period)
+				: null;
+			if (this.presenter.PresentAsync(device, swapChain, ticket, this.deadline, period, syncInterval, flipGrid, effects, this.presentWithoutLimit))
 			{
 				this.halves[this.halfIndex] = Math.Max(frameWork, this.presenter.GenerationLatency) / 2;
 				this.halfIndex = (this.halfIndex + 1) % this.halves.Length;
@@ -302,32 +317,38 @@ public unsafe class FramePacer: IDisposable
 			Thread.Sleep(10);
 	}
 
-	private bool ReadVBlank()
+	/// <summary>The scan-out of the game window's monitor. Opens it again when the monitor or the refresh rate changes</summary>
+	private ScanOut? ScanOutFor(Device* device)
 	{
-		DWM_TIMING_INFO info = default;
-		info.cbSize = (uint)sizeof(DWM_TIMING_INFO);
-		if (!DwmGetCompositionTimingInfo(default, &info).SUCCEEDED)
-			return false;
+		HWND window = (HWND)device->hWnd;
+		HMONITOR monitor = MonitorFromWindow(window, MONITOR.MONITOR_DEFAULTTONEAREST);
+		if (monitor == this.scanOutMonitor && device->FrameRate == this.scanOutRefresh)
+			return this.scanOut;
 
-		this.vblank = (long)info.qpcVBlank;
-		this.vblankPeriod = (long)info.qpcRefreshPeriod;
-		return this.vblankPeriod > 0;
+		this.scanOut?.Dispose();
+		this.scanOut = ScanOut.Open(window);
+		this.scanOutMonitor = monitor;
+		this.scanOutRefresh = device->FrameRate;
+		if (this.scanOut == null)
+			Service.PluginLog.Warning("The display does not report its scanline. Frame pacing cannot align with its vblanks.");
+		return this.scanOut;
 	}
 
-	/// <summary>
-	/// Returns the first time at or after this one when a Present issued at that time reaches the screen at the next
-	/// vblank.
-	/// </summary>
-	/// <summary>Returns the first vblank + offset that is at or after time.</summary>
-	private long AlignToVBlank(long time, long offset)
+	/// <summary>The number of refreshes per frame at rate frames per second, or 0 when it is not a whole number</summary>
+	private static int RefreshesPerFrame(ScanOut vblanks, int rate)
 	{
-		if (!this.ReadVBlank())
-			return time;
-
-		long next = this.vblank + ((time - this.vblank) / this.vblankPeriod + 1) * this.vblankPeriod;
-		long aligned = next + offset;
-		return aligned >= time ? aligned : aligned + this.vblankPeriod;
+		double frame = (double)Stopwatch.Frequency / rate;
+		double refreshes = Math.Round(frame / vblanks.Period);
+		return refreshes >= 1 && Math.Abs(frame - (refreshes * vblanks.Period)) <= vblanks.Period / 100 ? (int)refreshes : 0;
 	}
+
+	/// <summary>Returns the first vblank start + offset that is at or after time, or time without a scan-out</summary>
+	private static long AlignToVBlank(ScanOut? vblanks, long time, long offset) =>
+		vblanks != null && vblanks.TryNextVBlank(time - offset, out long vblank) ? vblank + offset : time;
+
+	/// <summary>Returns the vblank start nearest to deadline - offset, + offset</summary>
+	private static long SnapToVBlank(ScanOut vblanks, long deadline, long offset) =>
+		vblanks.TryNearestVBlank(deadline - offset, out long vblank) ? vblank + offset : deadline;
 
 	private void TrackHeadroom(bool missed)
 	{
@@ -437,6 +458,7 @@ public unsafe class FramePacer: IDisposable
 		this.presentHook?.Dispose();
 		this.presenter.Dispose();
 		this.timer.Dispose();
+		this.scanOut?.Dispose();
 		Dx.Release(this.held);
 		this.held = null;
 		GC.SuppressFinalize(this);

@@ -86,6 +86,7 @@ public sealed unsafe class Presenter: IDisposable
 	private GenerationTicket? ticket;
 	private long frameDue;
 	private long period;
+	private VBlankGrid? flipGrid;
 
 	// The back buffer of the last Present1 with capture, after ReShade's effects
 	private ID3D11Texture2D* lastShown;
@@ -194,10 +195,14 @@ public sealed unsafe class Presenter: IDisposable
 		return true;
 	}
 
-	/// <summary>The render thread must be idle. The presenter releases frameTicket.</summary>
+	/// <summary>
+	/// The render thread must be idle. The presenter releases frameTicket. With grid, the generated frame goes out at
+	/// the first grid time at or after it is due, and the real frame half a period later, so sync interval 0 flips
+	/// inside a vblank.
+	/// </summary>
 	/// <returns>False when the presenter cannot start</returns>
 	public bool PresentAsync(Device* device, SwapChain* kernelSwapChain, GenerationTicket? frameTicket, long due, long framePeriod, uint frameSyncInterval,
-		bool frameEffects, Action carrierPresent)
+		VBlankGrid? grid, bool frameEffects, Action carrierPresent)
 	{
 		if (!this.Active && !this.Start(device, kernelSwapChain))
 		{
@@ -219,6 +224,7 @@ public sealed unsafe class Presenter: IDisposable
 			this.asyncFrame = true;
 			this.frameDue = due;
 			this.period = framePeriod;
+			this.flipGrid = grid;
 			this.frame++;
 			this.pending = true;
 			this.syncInterval = frameSyncInterval;
@@ -280,6 +286,7 @@ public sealed unsafe class Presenter: IDisposable
 				GenerationTicket? frameTicket;
 				long frameStart;
 				long framePeriod;
+				VBlankGrid? grid;
 				bool yield;
 				lock (this.presentLock)
 				{
@@ -293,12 +300,13 @@ public sealed unsafe class Presenter: IDisposable
 					this.ticket = null;
 					frameStart = this.frameDue;
 					framePeriod = this.period;
+					grid = this.flipGrid;
 					yield = async && this.syncInterval != 0;
 				}
 
 				if (async)
 				{
-					long? generatedDue = this.ShowGeneratedWhenReady(current, frameTicket, frameStart, framePeriod, yield);
+					long? generatedDue = this.ShowGeneratedWhenReady(current, frameTicket, frameStart, framePeriod, grid, yield);
 					if (generatedDue == null)
 						return;
 
@@ -327,10 +335,10 @@ public sealed unsafe class Presenter: IDisposable
 	}
 
 	/// <summary>Releases frameTicket. Returns the generated frame's due time, or null when stop is signalled.</summary>
-	private long? ShowGeneratedWhenReady(long current, GenerationTicket? frameTicket, long frameStart, long framePeriod, bool yield)
+	private long? ShowGeneratedWhenReady(long current, GenerationTicket? frameTicket, long frameStart, long framePeriod, VBlankGrid? grid, bool yield)
 	{
 		long lag = (long)(this.learner.LagMs(framePeriod * 1000.0 / Stopwatch.Frequency) * Stopwatch.Frequency / 1000);
-		long generatedDue = frameStart + lag;
+		long generatedDue = grid is { } flips ? flips.Next(frameStart + lag) : frameStart + lag;
 		bool shown = false;
 		try
 		{

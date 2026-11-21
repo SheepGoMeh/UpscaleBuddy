@@ -38,6 +38,9 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 	private static readonly Upscaler[] UpscalersWithDlss = [.. Upscalers, Upscaler.NvidiaDlss];
 	private static readonly string[] UpscalerNamesWithDlss = [.. UpscalerNames, "NVIDIA DLSS / DLAA (the game's own)"];
 
+	private static readonly DlssPreset[] Presets = [DlssPreset.Default, DlssPreset.K, DlssPreset.J, DlssPreset.L, DlssPreset.M];
+	private static readonly string[] PresetNames = ["Default", "K", "J", "L", "M"];
+
 	public override void Draw()
 	{
 		ImGui.BeginDisabled(!dlssPath.Available);
@@ -61,7 +64,24 @@ public class ConfigWindow(UpscaleBuddyConfiguration configuration, DlssPath dlss
 		// XeSS has no sharpening pass. The game's own DLSS keeps its own settings.
 		bool nvidia = configuration.Upscaler == Upscaler.NvidiaDlss;
 		if (nvidia)
+		{
 			ImGui.TextDisabled("The game's graphics settings choose the DLSS quality and DLAA. Mode only turns DLSS on or off.");
+			int preset = Array.IndexOf(Presets, configuration.DlssPreset);
+			if (ImGui.Combo("DLSS preset", ref preset, PresetNames, PresetNames.Length))
+			{
+				configuration.DlssPreset = Presets[preset];
+				configuration.Save();
+			}
+
+			if (ImGui.IsItemHovered())
+			{
+				ImGui.SetTooltip(
+					"The DLSS model for every quality mode and DLAA.\n" +
+					"Default: NVIDIA's choice for each mode. K: best image quality, the highest cost.\n" +
+					"J: like K, with less ghosting and more flicker. L and M: NVIDIA's choice for Ultra Performance and Performance.\n" +
+					"An NVIDIA app override for the game takes priority.");
+			}
+		}
 		ImGui.BeginDisabled(configuration.Upscaler == Upscaler.IntelXess || nvidia);
 		if (ImGui.Checkbox("Sharpening (FSR only)", ref configuration.Sharpening))
 			configuration.Save();

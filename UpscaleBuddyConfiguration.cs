@@ -38,6 +38,16 @@ public enum FrameGenerationQueue
 	Compute,
 }
 
+// NVSDK_NGX_DLSS_Hint_Render_Preset values. Default is NVIDIA's choice for each quality mode.
+public enum DlssPreset : uint
+{
+	Default = 0,
+	J = 10,
+	K = 11,
+	L = 12,
+	M = 13,
+}
+
 public class UpscaleBuddyConfiguration: IPluginConfiguration
 {
 	public int Version { get; set; }
@@ -71,6 +81,9 @@ public class UpscaleBuddyConfiguration: IPluginConfiguration
 
 	// Sync interval 1 for frame generation's Presents, else 0
 	public bool FrameGenerationVsync = true;
+
+	// The render preset of the game's own DLSS, for every quality mode and DLAA. A create-time value.
+	public DlssPreset DlssPreset = DlssPreset.Default;
 
 	// Applies ReShade's effects to the scene before the UI, not to the finished frame (Game/ReShadeEffects)
 	public bool ReShadeBeforeUi;

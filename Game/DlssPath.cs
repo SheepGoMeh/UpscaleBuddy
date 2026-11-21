@@ -18,6 +18,7 @@ using UpscaleBuddy.D3D12;
 using UpscaleBuddy.Ffx;
 using UpscaleBuddy.FrameGeneration;
 using UpscaleBuddy.Fsr3;
+using UpscaleBuddy.Ngx;
 using UpscaleBuddy.Xess;
 
 using RenderCamera = FFXIVClientStructs.FFXIV.Client.Graphics.Render.Camera;
@@ -58,6 +59,8 @@ public unsafe class DlssPath: IDisposable
 	private const int CachedOutputSizeOffset = 0x150; // -1 makes the game query the render size again
 	private const int DeviceResizePendingOffset = 0x7A; // PostTick: release callbacks, swapchain resize, recreate callbacks
 	private const int StateFlagsOffset = 0x181; // bit 0 NGX initialized, bit 1 feature created
+	private const byte FlagNeedsCreate = 0x10; // At StateFlagsOffset: the game creates the feature again (IDA)
+	private const int FeatureSuperSampling = 1; // NVSDK_NGX_Feature_SuperSampling
 	private const int ParametersOffset = 0x158;
 	private const int FeatureOffset = 0x160;
 
@@ -152,8 +155,12 @@ public unsafe class DlssPath: IDisposable
 	private volatile State state = State.Idle;
 	private bool hooksEnabled;
 
-	// The game's own NGX runs. Only the evaluate hook is on. It reads the frame's inputs for frame generation.
+	// The game's own NGX runs. The create hook sets the DLSS preset. The evaluate hook reads the frame's inputs for frame
+	// generation.
 	private volatile bool nativeHooked;
+
+	// The DLSS preset of the game's current feature
+	private DlssPreset appliedPreset;
 	private bool supportChecked;
 	// NGX state of the DLSS object and the render size callback before activation
 	private byte savedFlags;
@@ -330,11 +337,14 @@ public unsafe class DlssPath: IDisposable
 		bool run = selected && this.configuration.Mode != UpscaleMode.Off && this.state == State.Idle && GameSettingIsDlss();
 		if (run)
 			this.SampleCamera();
+		if (run && this.nativeHooked && this.appliedPreset != this.configuration.DlssPreset)
+			this.RecreateNativeFeature();
 
 		if (run == this.nativeHooked)
 			return;
 
 		this.nativeHooked = run;
+		Toggle(this.createHook, run);
 		Toggle(this.evaluateHook, run);
 		this.frameReady = false;
 		if (run)
@@ -738,11 +748,36 @@ public unsafe class DlssPath: IDisposable
 		_ => throw new ArgumentOutOfRangeException(nameof(selected), selected, null),
 	};
 
+	/// <summary>Render thread. The game's own NGX creates the feature, with the configured DLSS preset.</summary>
+	private int CreateNative(ID3D11DeviceContext* context, int feature, nint parameterObject, nint* handle)
+	{
+		if (feature == FeatureSuperSampling)
+		{
+			DlssPreset preset = this.configuration.DlssPreset;
+			DlssPresets.Apply((NgxParameter*)parameterObject, preset);
+			this.appliedPreset = preset;
+		}
+
+		return this.createHook!.Original(context, feature, parameterObject, handle);
+	}
+
+	/// <summary>Framework thread. The game creates its DLSS feature again on a later frame.</summary>
+	private void RecreateNativeFeature()
+	{
+		this.appliedPreset = this.configuration.DlssPreset;
+		nint dlssObject = *(nint*)((byte*)PostEffectManager.Instance() + DlssObjectOffset);
+		if (dlssObject != 0)
+			*(byte*)(dlssObject + StateFlagsOffset) |= FlagNeedsCreate;
+	}
+
 	/// <summary>
 	/// Render thread. The command comes from FUN_140374a60.
 	/// </summary>
 	private int CreateDetour(ID3D11DeviceContext* context, int feature, nint parameterObject, nint* handle)
 	{
+		if (this.nativeHooked)
+			return this.CreateNative(context, feature, parameterObject, handle);
+
 		*handle = this.featureHandle;
 		this.DisposeRetired();
 

@@ -53,8 +53,20 @@ internal sealed unsafe class OverlayCapture: IDisposable
 		if (!this.armed)
 			return;
 
-		ImGuiNative.AddCallback(ImGui.GetBackgroundDrawList(),
+		ImDrawList* list = ImGui.GetBackgroundDrawList().Handle;
+		ImGuiNative.AddCallback(list,
 			(delegate*<ImDrawList*, ImDrawCmd*, void>)(nint)(delegate* unmanaged<ImDrawList*, ImDrawCmd*, void>)&Redirect, null);
+		MoveCallbackToFront(list);
+	}
+
+	/// <summary>The redirect callback must be the first command in the background draw list</summary>
+	private static void MoveCallbackToFront(ImDrawList* list)
+	{
+		// AddCallback adds the callback command and then an empty command to the end of the list.
+		Span<ImDrawCmd> commands = new(list->CmdBuffer.Data, list->CmdBuffer.Size - 1);
+		ImDrawCmd callback = commands[^1];
+		commands[..^1].CopyTo(commands[1..]);
+		commands[0] = callback;
 	}
 
 	[UnmanagedCallersOnly]

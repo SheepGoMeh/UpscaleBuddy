@@ -14,6 +14,15 @@ namespace UpscaleBuddy.D3D12;
 /// </summary>
 public unsafe class D3D12Upscaler: IUpscaler
 {
+	/// <summary>The arguments of IBackend.Record for one frame</summary>
+	private struct RecordState
+	{
+		public IBackend Backend;
+		public Input Color, MotionVectors, Depth, Reactive, Output;
+		public Fsr3Upscaler.DispatchParams Parameters;
+		public uint UpscaleWidth, UpscaleHeight;
+	}
+
 	private readonly Bridge bridge;
 	private readonly IBackend? backend;
 
@@ -101,13 +110,14 @@ public unsafe class D3D12Upscaler: IUpscaler
 		if (p.Measure)
 			this.timer.Mark(context, 1);
 
-		Fsr3Upscaler.DispatchParams parameters = p;
-		IBackend backend = this.backend!;
-		uint upscaleWidth = this.UpscaleWidth;
-		uint upscaleHeight = this.UpscaleHeight;
-		this.bridge.Execute(context,
-			list => backend.Record(list, colorTwin.Input, motionVectorsTwin.Input, depthTwin.Input, reactive, outputTwin.Input, parameters,
-				upscaleWidth, upscaleHeight),
+		RecordState state = new()
+		{
+			Backend = this.backend!, Color = colorTwin.Input, MotionVectors = motionVectorsTwin.Input, Depth = depthTwin.Input, Reactive = reactive,
+			Output = outputTwin.Input, Parameters = p, UpscaleWidth = this.UpscaleWidth, UpscaleHeight = this.UpscaleHeight,
+		};
+		this.bridge.Execute(context, state,
+			static (ID3D12GraphicsCommandList* list, in RecordState s) => s.Backend.Record(list, s.Color, s.MotionVectors, s.Depth, s.Reactive,
+				s.Output, s.Parameters, s.UpscaleWidth, s.UpscaleHeight),
 			p.Measure);
 
 		// D3D11 copies the output twin back into the game's output

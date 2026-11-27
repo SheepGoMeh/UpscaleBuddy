@@ -112,6 +112,16 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 		public ulong FrameId;
 	}
 
+	/// <summary>The arguments of Record for one frame</summary>
+	private struct RecordState
+	{
+		public FfxFrameGenerator Generator;
+		public FrameInputs Inputs;
+		public GenerationResources Resources;
+		public bool Reset;
+		public ulong FrameId;
+	}
+
 	private readonly Bridge bridge;
 	private readonly uint width, height;
 	private nint context;
@@ -174,12 +184,14 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 			Bridge.Copy(d3d11, motionTwin.Texture11, inputs.MotionVectors, motionTwin.Input);
 		this.bridge.CopyDepth(d3d11, inputs.Depth, depthTwin, inputs.RenderWidth, inputs.RenderHeight);
 
-		FrameInputs frame = inputs;
-		bool reset = inputs.Reset || this.first;
+		RecordState state = new()
+		{
+			Generator = this, Inputs = inputs, Resources = new GenerationResources(sceneTwin.Input, depthTwin.Input, motionTwin.Input, outputTwin.Input),
+			Reset = inputs.Reset || this.first, FrameId = ++this.frameId,
+		};
 		this.first = false;
-		ulong id = ++this.frameId;
-		GenerationResources resources = new(sceneTwin.Input, depthTwin.Input, motionTwin.Input, outputTwin.Input);
-		this.bridge.Execute(d3d11, list => this.Record(list, frame, resources, reset, id), false);
+		this.bridge.Execute(d3d11, state,
+			static (ID3D12GraphicsCommandList* list, in RecordState s) => s.Generator.Record(list, s.Inputs, s.Resources, s.Reset, s.FrameId), false);
 
 		Bridge.Copy(d3d11, result, outputTwin.Texture11, outputTwin.Input);
 	}

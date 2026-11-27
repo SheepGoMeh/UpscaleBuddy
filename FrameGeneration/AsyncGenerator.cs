@@ -33,6 +33,15 @@ public sealed unsafe class AsyncGenerator: IDisposable
 	private readonly record struct Job(Slot Slot, FrameInputs Inputs, ulong Input, ulong Output, bool Reset, ulong FrameId, FinishConstants Finish,
 		int LutIndex);
 
+	/// <summary>What the worker's record callback needs for one job</summary>
+	private struct RecordState
+	{
+		public AsyncGenerator Owner;
+		public Job Job;
+		public GenerationResources Resources;
+		public FinishResources FinishResources;
+	}
+
 	private readonly Bridge bridge;
 	private readonly FinishCalibrationResult calibration;
 	private readonly ColorFilterLuts luts;
@@ -167,31 +176,33 @@ public sealed unsafe class AsyncGenerator: IDisposable
 				{
 					// Every reserved output value needs a SubmitAsync.
 					job.Slot.Failed = true;
-					this.bridge.SubmitAsync(job.Input, job.Output, _ => { });
+					this.bridge.SubmitAsync(job.Input, job.Output, 0, static (ID3D12GraphicsCommandList* _, in int _) => { });
 					continue;
 				}
 
 				Slot slot = job.Slot;
-				FrameInputs inputs = job.Inputs;
-				GenerationResources resources = new(slot.Scene!.Input, slot.Depth!.Input, slot.MotionVectors!.Input, slot.Generated!.Input);
-				FinishResources finishResources = new(slot.Generated.Input.Resource,
-					(job.Finish.Flags & FinishConstants.UiDrawn) != 0 ? slot.Ui!.Input.Resource : null,
-					job.Finish.Strength > 0 ? this.luts.For(job.LutIndex) : null, this.calibration.BlendLut, slot.Finished!.Input.Resource);
-				FinishConstants constants = job.Finish;
-				this.bridge.SubmitAsync(job.Input, job.Output, list =>
+				RecordState state = new()
+				{
+					Owner = this, Job = job,
+					Resources = new GenerationResources(slot.Scene!.Input, slot.Depth!.Input, slot.MotionVectors!.Input, slot.Generated!.Input),
+					FinishResources = new FinishResources(slot.Generated.Input.Resource,
+						(job.Finish.Flags & FinishConstants.UiDrawn) != 0 ? slot.Ui!.Input.Resource : null,
+						job.Finish.Strength > 0 ? this.luts.For(job.LutIndex) : null, this.calibration.BlendLut, slot.Finished!.Input.Resource),
+				};
+				this.bridge.SubmitAsync(job.Input, job.Output, state, static (ID3D12GraphicsCommandList* list, in RecordState s) =>
 				{
 					try
 					{
-						this.generator.Record(list, inputs, resources, job.Reset, job.FrameId);
+						s.Owner.generator.Record(list, s.Job.Inputs, s.Resources, s.Job.Reset, s.Job.FrameId);
 						D3D12_RESOURCE_BARRIER barrier = D3D12_RESOURCE_BARRIER.InitUAV(null);
 						list->ResourceBarrier(1, &barrier);
-						this.finish.Record(list, slot.Index, finishResources, constants);
+						s.Owner.finish.Record(list, s.Job.Slot.Index, s.FinishResources, s.Job.Finish);
 					}
 					catch (Exception e)
 					{
 						// Set Failed before SubmitAsync signals the output.
-						slot.Failed = true;
-						this.failure ??= e;
+						s.Job.Slot.Failed = true;
+						s.Owner.failure ??= e;
 						throw;
 					}
 				}, true);

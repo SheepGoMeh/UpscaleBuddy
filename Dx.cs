@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -7,6 +8,7 @@ using TerraFX.Interop.Windows;
 using static TerraFX.Interop.DirectX.D3D_SRV_DIMENSION;
 using static TerraFX.Interop.DirectX.D3D11_BIND_FLAG;
 using static TerraFX.Interop.DirectX.D3D11_CPU_ACCESS_FLAG;
+using static TerraFX.Interop.DirectX.D3D11_DEVICE_CONTEXT_TYPE;
 using static TerraFX.Interop.DirectX.D3D11_FILTER;
 using static TerraFX.Interop.DirectX.D3D11_MAP;
 using static TerraFX.Interop.DirectX.D3D11_RESOURCE_MISC_FLAG;
@@ -165,6 +167,21 @@ public static unsafe class Dx
 		ThrowIfFailed(context->Map((ID3D11Resource*)buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
 		*(T*)mapped.pData = value;
 		context->Unmap((ID3D11Resource*)buffer, 0);
+	}
+
+	/// <summary>
+	/// Uploads value unless its bytes equal the last upload to this buffer. last is null for a new buffer.
+	/// Only the immediate context skips, because there a dynamic buffer keeps its content until the next map.
+	/// </summary>
+	public static void UploadIfChanged<T>(ID3D11DeviceContext* context, ID3D11Buffer* buffer, in T value, ref T? last) where T : unmanaged
+	{
+		bool immediate = context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+		if (immediate && last is { } previous &&
+		    MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in previous)).SequenceEqual(MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in value))))
+			return;
+
+		Upload(context, buffer, value);
+		last = immediate ? value : null;
 	}
 
 	/// <summary>Returns the view format for a typeless depth texture. Returns other formats as is</summary>

@@ -139,6 +139,7 @@ public unsafe class DlssPath: IDisposable
 	private readonly object upscalerLock = new();
 	private long lastEvaluate;
 	private bool loggedEvaluateError;
+	private (uint Width, uint Height, string? Text) supersamplingStatus; // Render thread
 	private FrameInputs frame;
 	private volatile bool frameReady;
 
@@ -859,11 +860,23 @@ public unsafe class DlssPath: IDisposable
 		return NgxParameters.Success;
 	}
 
+	/// <summary>Render thread. Builds the text only when the size changes</summary>
+	private string SupersamplingStatus(uint width, uint height)
+	{
+		if (this.supersamplingStatus.Text == null || this.supersamplingStatus.Width != width || this.supersamplingStatus.Height != height)
+			this.supersamplingStatus = (width, height, $"On, supersampling to {width}x{height}");
+
+		return this.supersamplingStatus.Text!;
+	}
+
 	/// <summary>
 	/// Render thread. The command comes from PostEffectManager.Submit.
 	/// </summary>
 	private int EvaluateDetour(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.Upscale);
+#endif
 		if (this.nativeHooked)
 			return this.EvaluateNative(context, handle, parameterObject, progress);
 
@@ -928,7 +941,7 @@ public unsafe class DlssPath: IDisposable
 
 			D3D11_TEXTURE2D_DESC outputDesc = Dx.GetDesc(gameOutput);
 			dispatch.Output = currentDownsampler.Intermediate;
-			this.Status = $"On, supersampling to {outputDesc.Width}x{outputDesc.Height}";
+			this.Status = this.SupersamplingStatus(outputDesc.Width, outputDesc.Height);
 		}
 
 		try

@@ -37,8 +37,9 @@ public sealed unsafe class Twin(ID3D11Texture2D* texture11, Input input)
 /// <summary>
 /// Records D3D12 work into the open command list.
 /// Every texture arrives in COMMON state, and the delegate must leave it in that state.
+/// state holds everything the delegate needs, so a static lambda can record without an allocation.
 /// </summary>
-public unsafe delegate void RecordDelegate(ID3D12GraphicsCommandList* list);
+public unsafe delegate void RecordDelegate<TState>(ID3D12GraphicsCommandList* list, in TState state);
 
 public enum QueueKind
 {
@@ -191,7 +192,7 @@ public unsafe class Bridge: IDisposable
 	/// When record fails, Execute still completes the fence handoff, and D3D11 waits on it.
 	/// Execute then rethrows the exception.
 	/// </summary>
-	public void Execute(ID3D11DeviceContext* context, RecordDelegate record, bool measure)
+	public void Execute<TState>(ID3D11DeviceContext* context, in TState state, RecordDelegate<TState> record, bool measure)
 	{
 		ID3D11DeviceContext4* context4 = this.Context4(context);
 		this.executeCount++;
@@ -203,7 +204,7 @@ public unsafe class Bridge: IDisposable
 
 		int slot = this.frame;
 		this.frame = (this.frame + 1) % Frames;
-		ExceptionDispatchInfo? failure = this.Record(slot, this.fence12, record, measure, out ID3D12GraphicsCommandList* list);
+		ExceptionDispatchInfo? failure = this.Record(slot, this.fence12, state, record, measure, out ID3D12GraphicsCommandList* list);
 
 		ThrowIfFailed(this.queue->Wait(this.fence12, this.fenceValue));
 		if (failure == null)
@@ -228,11 +229,11 @@ public unsafe class Bridge: IDisposable
 	public ulong ReserveOutput() => Interlocked.Increment(ref this.outputValue);
 
 	/// <summary>Call on the worker thread. This method signals output also when record throws.</summary>
-	public void SubmitAsync(ulong input, ulong output, RecordDelegate record, bool measure = false)
+	public void SubmitAsync<TState>(ulong input, ulong output, in TState state, RecordDelegate<TState> record, bool measure = false)
 	{
 		int slot = Frames + this.asyncFrame;
 		this.asyncFrame = (this.asyncFrame + 1) % Frames;
-		ExceptionDispatchInfo? failure = this.Record(slot, this.outputFence, record, measure, out ID3D12GraphicsCommandList* list);
+		ExceptionDispatchInfo? failure = this.Record(slot, this.outputFence, state, record, measure, out ID3D12GraphicsCommandList* list);
 
 		ThrowIfFailed(this.queue->Wait(this.inputFence12, input));
 		if (failure == null)
@@ -265,7 +266,8 @@ public unsafe class Bridge: IDisposable
 	}
 
 	/// <summary>This method closes the list also when record throws.</summary>
-	private ExceptionDispatchInfo? Record(int slot, ID3D12Fence* fence, RecordDelegate record, bool measure, out ID3D12GraphicsCommandList* list)
+	private ExceptionDispatchInfo? Record<TState>(int slot, ID3D12Fence* fence, in TState state, RecordDelegate<TState> record, bool measure,
+		out ID3D12GraphicsCommandList* list)
 	{
 		list = this.lists[slot];
 		long waitStart = Stopwatch.GetTimestamp();
@@ -287,7 +289,7 @@ public unsafe class Bridge: IDisposable
 		ExceptionDispatchInfo? failure = null;
 		try
 		{
-			record(list);
+			record(list, state);
 			if (measure)
 			{
 				list->EndQuery(this.queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ((uint)slot * 2) + 1);
@@ -402,6 +404,13 @@ public unsafe class Bridge: IDisposable
 			texture->Release();
 			throw;
 		}
+	}
+
+	/// <summary>Our twin at the size of source, in the format of source unless a format is given</summary>
+	public Twin CreateTwinLike(ID3D11Texture2D* source, DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN)
+	{
+		D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(source);
+		return this.CreateTwin(format == DXGI_FORMAT_UNKNOWN ? desc.Format : format, desc.Width, desc.Height);
 	}
 
 	public static void Release(Twin? twin)

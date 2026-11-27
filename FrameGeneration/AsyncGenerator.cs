@@ -33,6 +33,15 @@ public sealed unsafe class AsyncGenerator: IDisposable
 	private readonly record struct Job(Slot Slot, FrameInputs Inputs, ulong Input, ulong Output, bool Reset, ulong FrameId, FinishConstants Finish,
 		int LutIndex);
 
+	/// <summary>What the worker's record callback needs for one job</summary>
+	private struct RecordState
+	{
+		public AsyncGenerator Owner;
+		public Job Job;
+		public GenerationResources Resources;
+		public FinishResources FinishResources;
+	}
+
 	private readonly Bridge bridge;
 	private readonly FinishCalibrationResult calibration;
 	private readonly ColorFilterLuts luts;
@@ -94,15 +103,12 @@ public sealed unsafe class AsyncGenerator: IDisposable
 			return null;
 		}
 
-		D3D11_TEXTURE2D_DESC depthDesc = Dx.GetDesc(inputs.Depth);
-		D3D11_TEXTURE2D_DESC motionDesc = Dx.GetDesc(inputs.MotionVectors);
-		D3D11_TEXTURE2D_DESC uiDesc = Dx.GetDesc(ui);
 		slot.Scene ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
 		slot.Generated ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
 		slot.Finished ??= this.bridge.CreateTwin(DXGI_FORMAT_R8G8B8A8_TYPELESS, this.width, this.height);
-		slot.Depth ??= this.bridge.CreateTwin(DXGI_FORMAT_R32_FLOAT, depthDesc.Width, depthDesc.Height);
-		slot.MotionVectors ??= this.bridge.CreateTwin(motionDesc.Format, motionDesc.Width, motionDesc.Height);
-		slot.Ui ??= this.bridge.CreateTwin(uiDesc.Format, uiDesc.Width, uiDesc.Height);
+		slot.Depth ??= this.bridge.CreateTwinLike(inputs.Depth, DXGI_FORMAT_R32_FLOAT);
+		slot.MotionVectors ??= this.bridge.CreateTwinLike(inputs.MotionVectors);
+		slot.Ui ??= this.bridge.CreateTwinLike(ui);
 
 		Bridge.Copy(context, slot.Scene.Texture11, inputs.Scene, slot.Scene.Input);
 		Bridge.Copy(context, slot.MotionVectors.Texture11, inputs.MotionVectors, slot.MotionVectors.Input);
@@ -157,37 +163,43 @@ public sealed unsafe class AsyncGenerator: IDisposable
 	{
 		foreach (Job job in this.jobs.GetConsumingEnumerable())
 		{
+#if DEBUG
+			PerfLog.WorkerJob();
+			using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.FrameGenerationWorker);
+#endif
 			try
 			{
 				if (this.failure != null)
 				{
 					// Every reserved output value needs a SubmitAsync.
 					job.Slot.Failed = true;
-					this.bridge.SubmitAsync(job.Input, job.Output, _ => { });
+					this.bridge.SubmitAsync(job.Input, job.Output, 0, static (ID3D12GraphicsCommandList* _, in int _) => { });
 					continue;
 				}
 
 				Slot slot = job.Slot;
-				FrameInputs inputs = job.Inputs;
-				GenerationResources resources = new(slot.Scene!.Input, slot.Depth!.Input, slot.MotionVectors!.Input, slot.Generated!.Input);
-				FinishResources finishResources = new(slot.Generated.Input.Resource,
-					(job.Finish.Flags & FinishConstants.UiDrawn) != 0 ? slot.Ui!.Input.Resource : null,
-					job.Finish.Strength > 0 ? this.luts.For(job.LutIndex) : null, this.calibration.BlendLut, slot.Finished!.Input.Resource);
-				FinishConstants constants = job.Finish;
-				this.bridge.SubmitAsync(job.Input, job.Output, list =>
+				RecordState state = new()
+				{
+					Owner = this, Job = job,
+					Resources = new GenerationResources(slot.Scene!.Input, slot.Depth!.Input, slot.MotionVectors!.Input, slot.Generated!.Input),
+					FinishResources = new FinishResources(slot.Generated.Input.Resource,
+						(job.Finish.Flags & FinishConstants.UiDrawn) != 0 ? slot.Ui!.Input.Resource : null,
+						job.Finish.Strength > 0 ? this.luts.For(job.LutIndex) : null, this.calibration.BlendLut, slot.Finished!.Input.Resource),
+				};
+				this.bridge.SubmitAsync(job.Input, job.Output, state, static (ID3D12GraphicsCommandList* list, in RecordState s) =>
 				{
 					try
 					{
-						this.generator.Record(list, inputs, resources, job.Reset, job.FrameId);
+						s.Owner.generator.Record(list, s.Job.Inputs, s.Resources, s.Job.Reset, s.Job.FrameId);
 						D3D12_RESOURCE_BARRIER barrier = D3D12_RESOURCE_BARRIER.InitUAV(null);
 						list->ResourceBarrier(1, &barrier);
-						this.finish.Record(list, slot.Index, finishResources, constants);
+						s.Owner.finish.Record(list, s.Job.Slot.Index, s.FinishResources, s.Job.Finish);
 					}
 					catch (Exception e)
 					{
 						// Set Failed before SubmitAsync signals the output.
-						slot.Failed = true;
-						this.failure ??= e;
+						s.Job.Slot.Failed = true;
+						s.Owner.failure ??= e;
 						throw;
 					}
 				}, true);

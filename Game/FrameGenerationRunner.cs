@@ -28,6 +28,9 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	private bool failed;
 	private int skipped;
 
+	// Status while a generator runs, built when the generator is created
+	private string runningStatus = "", asyncRunningStatus = "";
+
 	// Only the render thread uses these fields. Each device has one bridge, one calibration and one LUT set.
 	private Bridge? asyncBridge;
 	private FinishCalibrationResult? calibration;
@@ -105,6 +108,9 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	/// </summary>
 	public bool Generate(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* output)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.FrameGenerationSync);
+#endif
 		if (!this.TakeInputs(scene, out FrameInputs inputs))
 			return false;
 
@@ -113,7 +119,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 		{
 			this.Fit(context, scene->ActualWidth, scene->ActualHeight, inputs);
 			this.generator!.Generate(context, inputs, (ID3D11Texture2D*)output->D3D11Texture2D);
-			this.Status = $"On, {this.generator.Name}";
+			this.Status = this.runningStatus;
 			return true;
 		}
 		catch (Exception e)
@@ -127,6 +133,9 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	public GenerationTicket? Submit(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* ui, bool uiDrawn, in FinishConstants finish,
 		int lutIndex)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.FrameGenerationSubmit);
+#endif
 		if (!this.TakeInputs(scene, out FrameInputs inputs))
 			return null;
 
@@ -166,7 +175,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 				this.pendingTicket = ticket;
 			}
 
-			this.Status = $"On, {generator.Name}, async on the compute queue";
+			this.Status = this.asyncRunningStatus;
 			return ticket;
 		}
 		catch (Exception e)
@@ -236,6 +245,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 		{
 			this.bridge = new Bridge(device);
 			this.generator = new FfxFrameGenerator(this.bridge, sceneWidth, sceneHeight, depth.Width, depth.Height, inputs.InfiniteFar);
+			this.runningStatus = $"On, {this.generator.Name}";
 			this.width = sceneWidth;
 			this.height = sceneHeight;
 			this.maxRenderWidth = depth.Width;
@@ -283,6 +293,7 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 
 			this.asyncGenerator = new AsyncGenerator(this.asyncBridge, this.calibration, this.luts, sceneWidth, sceneHeight, depth.Width, depth.Height,
 				inputs.InfiniteFar);
+			this.asyncRunningStatus = $"On, {this.asyncGenerator.Name}, async on the compute queue";
 			this.width = sceneWidth;
 			this.height = sceneHeight;
 			this.maxRenderWidth = depth.Width;

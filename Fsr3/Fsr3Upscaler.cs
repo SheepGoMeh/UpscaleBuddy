@@ -93,15 +93,83 @@ public unsafe class Fsr3Upscaler: IUpscaler
 		public readonly ID3D11UnorderedAccessView* Uav = uav;
 	}
 
-	private sealed class Pass(ID3D11ComputeShader* shader, List<(string Kind, string Name, uint Slot)> bindings)
+	private sealed class Pass(ID3D11ComputeShader* shader, Binding[] bindings)
 	{
 		public readonly ID3D11ComputeShader* Shader = shader;
-		public readonly List<(string Kind, string Name, uint Slot)> Bindings = bindings;
+		public readonly Binding[] Bindings = bindings;
 	}
 
-	private delegate ID3D11ShaderResourceView* SrvLookup(string name);
+	private enum BindingKind
+	{
+		Srv,
+		Uav,
+		ConstantBuffer,
+	}
 
-	private delegate ID3D11UnorderedAccessView* UavLookup(string name);
+	/// <summary>One line of a pass's binding list. View is a SrvId, UavId or ConstantsId, by kind</summary>
+	private readonly record struct Binding(BindingKind Kind, int View, uint Slot);
+
+	// What the shaders can read and write. Dispatch fills one view per entry, each frame
+	private enum SrvId
+	{
+		InputColor,
+		InputMotionVectors,
+		InputDepth,
+		InputExposure,
+		ReactiveMask,
+		TransparencyMask,
+		ReconstructedPreviousDepth,
+		DilatedMotionVectors,
+		DilatedDepth,
+		InternalUpscaled,
+		Accumulation,
+		LumaHistory,
+		RcasInput,
+		LanczosLut,
+		SpdMips,
+		DilatedReactiveMasks,
+		NewLocks,
+		Intermediate,
+		FarthestDepthMip1,
+		ShadingChange,
+		CurrentLuma,
+		PreviousLuma,
+		FrameInfo,
+		Count,
+	}
+
+	private enum UavId
+	{
+		ReconstructedPreviousDepth,
+		DilatedMotionVectors,
+		DilatedDepth,
+		InternalUpscaled,
+		Accumulation,
+		LumaHistory,
+		UpscaledOutput,
+		DilatedReactiveMasks,
+		FrameInfo,
+		SpdAtomic,
+		NewLocks,
+		ShadingChange,
+		Intermediate,
+		FarthestDepthMip1,
+		CurrentLuma,
+		SpdMip0,
+		SpdMip1,
+		SpdMip2,
+		SpdMip3,
+		SpdMip4,
+		SpdMip5,
+		Count,
+	}
+
+	private enum ConstantsId
+	{
+		Upscaler,
+		Spd,
+		Rcas,
+	}
 
 	private const int MaxQueuedFrames = 16;
 	private const float FltEpsilon = 1.1920929e-7f;
@@ -115,7 +183,8 @@ public unsafe class Fsr3Upscaler: IUpscaler
 
 	// Released on dispose, as IUnknown*
 	private readonly List<nint> owned = [];
-	private readonly Dictionary<string, Pass> passes = [];
+	private readonly Pass prepareInputs, lumaPyramid, shadingChangePyramid, shadingChangePass, prepareReactivity, lumaInstability, accumulate,
+		accumulateSharpen, rcasPass;
 
 	// Views on the game's textures by texture. They keep the textures alive, so a new texture can't reuse an address.
 	private readonly Dictionary<nint, nint> inputSrvs = [];
@@ -143,6 +212,8 @@ public unsafe class Fsr3Upscaler: IUpscaler
 	private readonly ID3D11Buffer* constantBuffer;
 	private readonly ID3D11Buffer* spdBuffer;
 	private readonly ID3D11Buffer* rcasBuffer;
+	private SpdConstants? uploadedSpd; // The content of spdBuffer
+	private RcasConstants? uploadedRcas; // The content of rcasBuffer
 	private readonly ID3D11SamplerState*[] samplers = new ID3D11SamplerState*[2];
 
 	private readonly GpuTimer timer;
@@ -187,14 +258,15 @@ public unsafe class Fsr3Upscaler: IUpscaler
 
 		try
 		{
-			foreach (string name in new[]
-			         {
-				         "prepare_inputs", "luma_pyramid", "shading_change_pyramid", "shading_change", "prepare_reactivity",
-				         "luma_instability", "accumulate", "accumulate_sharpen", "rcas",
-			         })
-			{
-				this.passes[name] = this.LoadPass(name);
-			}
+			this.prepareInputs = this.LoadPass("prepare_inputs");
+			this.lumaPyramid = this.LoadPass("luma_pyramid");
+			this.shadingChangePyramid = this.LoadPass("shading_change_pyramid");
+			this.shadingChangePass = this.LoadPass("shading_change");
+			this.prepareReactivity = this.LoadPass("prepare_reactivity");
+			this.lumaInstability = this.LoadPass("luma_instability");
+			this.accumulate = this.LoadPass("accumulate");
+			this.accumulateSharpen = this.LoadPass("accumulate_sharpen");
+			this.rcasPass = this.LoadPass("rcas");
 
 			uint rw = maxRenderWidth, rh = maxRenderHeight, uw = upscaleWidth, uh = upscaleHeight;
 			for (int i = 0; i < 2; i++)
@@ -319,73 +391,70 @@ public unsafe class Fsr3Upscaler: IUpscaler
 		};
 
 		Dx.Upload(context, this.constantBuffer, this.constants);
-		Dx.Upload(context, this.spdBuffer, spd);
-		Dx.Upload(context, this.rcasBuffer, rcas);
+		Dx.UploadIfChanged(context, this.spdBuffer, spd, ref this.uploadedSpd);
+		Dx.UploadIfChanged(context, this.rcasBuffer, rcas, ref this.uploadedRcas);
 
 		int currentLuma = odd ? 1 : 0;
 		int previousLuma = odd ? 0 : 1;
-		ID3D11ShaderResourceView* Srv(string name) => name switch
-		{
-			"r_input_color_jittered" => color,
-			"r_input_motion_vectors" => motionVectors,
-			"r_input_depth" => depth,
-			"r_input_exposure" => this.defaultExposure.Srv,
-			"r_reactive_mask" => reactive,
-			"r_transparency_and_composition_mask" => this.defaultReactivity.Srv,
-			"r_reconstructed_previous_nearest_depth" => this.reconstructedPreviousDepth.Srv,
-			"r_dilated_motion_vectors" => this.dilatedMotionVectors.Srv,
-			"r_dilated_depth" => this.dilatedDepth.Srv,
-			"r_internal_upscaled_color" => this.upscaled[srvIndex].Srv,
-			"r_accumulation" => this.accumulation[srvIndex].Srv,
-			"r_luma_history" => this.lumaHistory[srvIndex].Srv,
-			"r_rcas_input" => this.upscaled[uavIndex].Srv,
-			"r_lanczos_lut" => this.lanczosLut.Srv,
-			"r_spd_mips" => this.spdMips.Srv,
-			"r_dilated_reactive_masks" => this.dilatedReactiveMasks.Srv,
-			"r_new_locks" => this.newLocks.Srv,
-			"r_farthest_depth" or "r_luma_instability" => this.intermediate.Srv,
-			"r_farthest_depth_mip1" => this.farthestDepthMip1.Srv,
-			"r_shading_change" => this.shadingChange.Srv,
-			"r_current_luma" => this.luma[currentLuma].Srv,
-			"r_previous_luma" => this.luma[previousLuma].Srv,
-			"r_frame_info" => this.frameInfo.Srv,
-			_ => throw new InvalidOperationException($"unknown SRV {name}"),
-		};
-		ID3D11UnorderedAccessView* Uav(string name) => name switch
-		{
-			"rw_reconstructed_previous_nearest_depth" => this.reconstructedPreviousDepth.Uav,
-			"rw_dilated_motion_vectors" => this.dilatedMotionVectors.Uav,
-			"rw_dilated_depth" => this.dilatedDepth.Uav,
-			"rw_internal_upscaled_color" => this.upscaled[uavIndex].Uav,
-			"rw_accumulation" => this.accumulation[uavIndex].Uav,
-			"rw_luma_history" => this.lumaHistory[uavIndex].Uav,
-			"rw_upscaled_output" => output,
-			"rw_dilated_reactive_masks" => this.dilatedReactiveMasks.Uav,
-			"rw_frame_info" => this.frameInfo.Uav,
-			"rw_spd_global_atomic" => this.spdAtomic.Uav,
-			"rw_new_locks" => this.newLocks.Uav,
-			"rw_shading_change" => this.shadingChange.Uav,
-			"rw_farthest_depth" or "rw_luma_instability" => this.intermediate.Uav,
-			"rw_farthest_depth_mip1" => this.farthestDepthMip1.Uav,
-			"rw_current_luma" => this.luma[currentLuma].Uav,
-			_ when name.StartsWith("rw_spd_mip") => this.spdMipUavs[name[^1] - '0'],
-			_ => throw new InvalidOperationException($"unknown UAV {name}"),
-		};
+
+		ID3D11ShaderResourceView** srvs = stackalloc ID3D11ShaderResourceView*[(int)SrvId.Count];
+		srvs[(int)SrvId.InputColor] = color;
+		srvs[(int)SrvId.InputMotionVectors] = motionVectors;
+		srvs[(int)SrvId.InputDepth] = depth;
+		srvs[(int)SrvId.InputExposure] = this.defaultExposure.Srv;
+		srvs[(int)SrvId.ReactiveMask] = reactive;
+		srvs[(int)SrvId.TransparencyMask] = this.defaultReactivity.Srv;
+		srvs[(int)SrvId.ReconstructedPreviousDepth] = this.reconstructedPreviousDepth.Srv;
+		srvs[(int)SrvId.DilatedMotionVectors] = this.dilatedMotionVectors.Srv;
+		srvs[(int)SrvId.DilatedDepth] = this.dilatedDepth.Srv;
+		srvs[(int)SrvId.InternalUpscaled] = this.upscaled[srvIndex].Srv;
+		srvs[(int)SrvId.Accumulation] = this.accumulation[srvIndex].Srv;
+		srvs[(int)SrvId.LumaHistory] = this.lumaHistory[srvIndex].Srv;
+		srvs[(int)SrvId.RcasInput] = this.upscaled[uavIndex].Srv;
+		srvs[(int)SrvId.LanczosLut] = this.lanczosLut.Srv;
+		srvs[(int)SrvId.SpdMips] = this.spdMips.Srv;
+		srvs[(int)SrvId.DilatedReactiveMasks] = this.dilatedReactiveMasks.Srv;
+		srvs[(int)SrvId.NewLocks] = this.newLocks.Srv;
+		srvs[(int)SrvId.Intermediate] = this.intermediate.Srv;
+		srvs[(int)SrvId.FarthestDepthMip1] = this.farthestDepthMip1.Srv;
+		srvs[(int)SrvId.ShadingChange] = this.shadingChange.Srv;
+		srvs[(int)SrvId.CurrentLuma] = this.luma[currentLuma].Srv;
+		srvs[(int)SrvId.PreviousLuma] = this.luma[previousLuma].Srv;
+		srvs[(int)SrvId.FrameInfo] = this.frameInfo.Srv;
+
+		ID3D11UnorderedAccessView** uavs = stackalloc ID3D11UnorderedAccessView*[(int)UavId.Count];
+		uavs[(int)UavId.ReconstructedPreviousDepth] = this.reconstructedPreviousDepth.Uav;
+		uavs[(int)UavId.DilatedMotionVectors] = this.dilatedMotionVectors.Uav;
+		uavs[(int)UavId.DilatedDepth] = this.dilatedDepth.Uav;
+		uavs[(int)UavId.InternalUpscaled] = this.upscaled[uavIndex].Uav;
+		uavs[(int)UavId.Accumulation] = this.accumulation[uavIndex].Uav;
+		uavs[(int)UavId.LumaHistory] = this.lumaHistory[uavIndex].Uav;
+		uavs[(int)UavId.UpscaledOutput] = output;
+		uavs[(int)UavId.DilatedReactiveMasks] = this.dilatedReactiveMasks.Uav;
+		uavs[(int)UavId.FrameInfo] = this.frameInfo.Uav;
+		uavs[(int)UavId.SpdAtomic] = this.spdAtomic.Uav;
+		uavs[(int)UavId.NewLocks] = this.newLocks.Uav;
+		uavs[(int)UavId.ShadingChange] = this.shadingChange.Uav;
+		uavs[(int)UavId.Intermediate] = this.intermediate.Uav;
+		uavs[(int)UavId.FarthestDepthMip1] = this.farthestDepthMip1.Uav;
+		uavs[(int)UavId.CurrentLuma] = this.luma[currentLuma].Uav;
+		for (int mip = 0; mip < SpdUavMips; mip++)
+			uavs[(int)UavId.SpdMip0 + mip] = this.spdMipUavs[mip];
 
 		uint srcX = (uint)(this.constants.RenderWidth + 7) / 8, srcY = (uint)(this.constants.RenderHeight + 7) / 8;
 		uint dstX = (uint)(this.constants.UpscaleWidth + 7) / 8, dstY = (uint)(this.constants.UpscaleHeight + 7) / 8;
 		uint changeX = (uint)((int)(this.constants.RenderWidth * 0.5f) + 7) / 8;
 		uint changeY = (uint)((int)(this.constants.RenderHeight * 0.5f) + 7) / 8;
 
-		this.Run(context, "prepare_inputs", srcX, srcY, Srv, Uav);
-		this.Run(context, "luma_pyramid", spdGroupsX, spdGroupsY, Srv, Uav);
-		this.Run(context, "shading_change_pyramid", spdGroupsX, spdGroupsY, Srv, Uav);
-		this.Run(context, "shading_change", changeX, changeY, Srv, Uav);
-		this.Run(context, "prepare_reactivity", srcX, srcY, Srv, Uav);
-		this.Run(context, "luma_instability", srcX, srcY, Srv, Uav);
-		this.Run(context, p.Sharpen ? "accumulate_sharpen" : "accumulate", dstX, dstY, Srv, Uav);
+		this.Run(context, this.prepareInputs, srcX, srcY, srvs, uavs);
+		this.Run(context, this.lumaPyramid, spdGroupsX, spdGroupsY, srvs, uavs);
+		this.Run(context, this.shadingChangePyramid, spdGroupsX, spdGroupsY, srvs, uavs);
+		this.Run(context, this.shadingChangePass, changeX, changeY, srvs, uavs);
+		this.Run(context, this.prepareReactivity, srcX, srcY, srvs, uavs);
+		this.Run(context, this.lumaInstability, srcX, srcY, srvs, uavs);
+		this.Run(context, p.Sharpen ? this.accumulateSharpen : this.accumulate, dstX, dstY, srvs, uavs);
 		if (p.Sharpen)
-			this.Run(context, "rcas", (uint)(this.constants.UpscaleWidth + 15) / 16, (uint)(this.constants.UpscaleHeight + 15) / 16, Srv, Uav);
+			this.Run(context, this.rcasPass, (uint)(this.constants.UpscaleWidth + 15) / 16, (uint)(this.constants.UpscaleHeight + 15) / 16, srvs, uavs);
 
 		Unbind(context);
 		if (p.Measure)
@@ -454,26 +523,29 @@ public unsafe class Fsr3Upscaler: IUpscaler
 		c.FrameIndex = reset ? 0.0f : c.FrameIndex + 1.0f;
 	}
 
-	private void Run(ID3D11DeviceContext* context, string passName, uint x, uint y, SrvLookup srv, UavLookup uav)
+	private void Run(ID3D11DeviceContext* context, Pass pass, uint x, uint y, ID3D11ShaderResourceView** srvViews,
+		ID3D11UnorderedAccessView** uavViews)
 	{
-		Pass pass = this.passes[passName];
 		ID3D11ShaderResourceView** srvs = stackalloc ID3D11ShaderResourceView*[16];
 		ID3D11UnorderedAccessView** uavs = stackalloc ID3D11UnorderedAccessView*[16];
 		ID3D11Buffer** buffers = stackalloc ID3D11Buffer*[4];
 		uint uavCount = 0, bufferCount = 0;
-		foreach ((string kind, string name, uint slot) in pass.Bindings)
+		foreach ((BindingKind kind, int view, uint slot) in pass.Bindings)
 		{
 			switch (kind)
 			{
-				case "srv":
-					srvs[slot] = srv(name);
+				case BindingKind.Srv:
+					srvs[slot] = srvViews[view];
 					break;
-				case "uav":
-					uavs[slot] = uav(name);
+				case BindingKind.Uav:
+					uavs[slot] = uavViews[view];
 					uavCount = Math.Max(uavCount, slot + 1);
 					break;
-				case "cb":
-					buffers[slot] = name switch { "cbSPD" => this.spdBuffer, "cbRCAS" => this.rcasBuffer, _ => this.constantBuffer };
+				case BindingKind.ConstantBuffer:
+					buffers[slot] = (ConstantsId)view switch
+					{
+						ConstantsId.Spd => this.spdBuffer, ConstantsId.Rcas => this.rcasBuffer, _ => this.constantBuffer,
+					};
 					bufferCount = Math.Max(bufferCount, slot + 1);
 					break;
 			}
@@ -573,17 +645,92 @@ public unsafe class Fsr3Upscaler: IUpscaler
 
 	private Pass LoadPass(string name)
 	{
-		List<(string, string, uint)> bindings = [];
+		List<Binding> bindings = [];
 		using StreamReader reader = new(new MemoryStream(Dx.ReadResource($"Shaders.{name}.txt")));
 		while (reader.ReadLine() is { } line)
 		{
 			string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-			if (parts.Length == 3)
-				bindings.Add((parts[0], parts[1], uint.Parse(parts[2])));
+			if (parts.Length != 3)
+				continue;
+
+			uint slot = uint.Parse(parts[2]);
+			switch (parts[0])
+			{
+				case "srv":
+					bindings.Add(new Binding(BindingKind.Srv, (int)SrvNamed(parts[1]), slot));
+					break;
+				case "uav":
+					bindings.Add(new Binding(BindingKind.Uav, (int)UavNamed(parts[1]), slot));
+					break;
+				case "cb":
+					bindings.Add(new Binding(BindingKind.ConstantBuffer, (int)ConstantsNamed(parts[1]), slot));
+					break;
+			}
 		}
 
-		return new Pass(this.Own(Dx.CreateComputeShader(this.device, $"Shaders.{name}.cso")), bindings);
+		return new Pass(this.Own(Dx.CreateComputeShader(this.device, $"Shaders.{name}.cso")), bindings.ToArray());
 	}
+
+	private static SrvId SrvNamed(string name) => name switch
+	{
+		"r_input_color_jittered" => SrvId.InputColor,
+		"r_input_motion_vectors" => SrvId.InputMotionVectors,
+		"r_input_depth" => SrvId.InputDepth,
+		"r_input_exposure" => SrvId.InputExposure,
+		"r_reactive_mask" => SrvId.ReactiveMask,
+		"r_transparency_and_composition_mask" => SrvId.TransparencyMask,
+		"r_reconstructed_previous_nearest_depth" => SrvId.ReconstructedPreviousDepth,
+		"r_dilated_motion_vectors" => SrvId.DilatedMotionVectors,
+		"r_dilated_depth" => SrvId.DilatedDepth,
+		"r_internal_upscaled_color" => SrvId.InternalUpscaled,
+		"r_accumulation" => SrvId.Accumulation,
+		"r_luma_history" => SrvId.LumaHistory,
+		"r_rcas_input" => SrvId.RcasInput,
+		"r_lanczos_lut" => SrvId.LanczosLut,
+		"r_spd_mips" => SrvId.SpdMips,
+		"r_dilated_reactive_masks" => SrvId.DilatedReactiveMasks,
+		"r_new_locks" => SrvId.NewLocks,
+		"r_farthest_depth" or "r_luma_instability" => SrvId.Intermediate,
+		"r_farthest_depth_mip1" => SrvId.FarthestDepthMip1,
+		"r_shading_change" => SrvId.ShadingChange,
+		"r_current_luma" => SrvId.CurrentLuma,
+		"r_previous_luma" => SrvId.PreviousLuma,
+		"r_frame_info" => SrvId.FrameInfo,
+		_ => throw new InvalidOperationException($"unknown SRV {name}"),
+	};
+
+	private static UavId UavNamed(string name) => name switch
+	{
+		"rw_reconstructed_previous_nearest_depth" => UavId.ReconstructedPreviousDepth,
+		"rw_dilated_motion_vectors" => UavId.DilatedMotionVectors,
+		"rw_dilated_depth" => UavId.DilatedDepth,
+		"rw_internal_upscaled_color" => UavId.InternalUpscaled,
+		"rw_accumulation" => UavId.Accumulation,
+		"rw_luma_history" => UavId.LumaHistory,
+		"rw_upscaled_output" => UavId.UpscaledOutput,
+		"rw_dilated_reactive_masks" => UavId.DilatedReactiveMasks,
+		"rw_frame_info" => UavId.FrameInfo,
+		"rw_spd_global_atomic" => UavId.SpdAtomic,
+		"rw_new_locks" => UavId.NewLocks,
+		"rw_shading_change" => UavId.ShadingChange,
+		"rw_farthest_depth" or "rw_luma_instability" => UavId.Intermediate,
+		"rw_farthest_depth_mip1" => UavId.FarthestDepthMip1,
+		"rw_current_luma" => UavId.CurrentLuma,
+		"rw_spd_mip0" => UavId.SpdMip0,
+		"rw_spd_mip1" => UavId.SpdMip1,
+		"rw_spd_mip2" => UavId.SpdMip2,
+		"rw_spd_mip3" => UavId.SpdMip3,
+		"rw_spd_mip4" => UavId.SpdMip4,
+		"rw_spd_mip5" => UavId.SpdMip5,
+		_ => throw new InvalidOperationException($"unknown UAV {name}"),
+	};
+
+	private static ConstantsId ConstantsNamed(string name) => name switch
+	{
+		"cbSPD" => ConstantsId.Spd,
+		"cbRCAS" => ConstantsId.Rcas,
+		_ => ConstantsId.Upscaler,
+	};
 
 	public void Dispose()
 	{

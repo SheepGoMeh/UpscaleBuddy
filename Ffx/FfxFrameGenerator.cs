@@ -112,6 +112,16 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 		public ulong FrameId;
 	}
 
+	/// <summary>The arguments of Record for one frame</summary>
+	private struct RecordState
+	{
+		public FfxFrameGenerator Generator;
+		public FrameInputs Inputs;
+		public GenerationResources Resources;
+		public bool Reset;
+		public ulong FrameId;
+	}
+
 	private readonly Bridge bridge;
 	private readonly uint width, height;
 	private nint context;
@@ -160,13 +170,11 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 
 	public void Generate(ID3D11DeviceContext* d3d11, in FrameInputs inputs, ID3D11Texture2D* result)
 	{
-		D3D11_TEXTURE2D_DESC depthDesc = Dx.GetDesc(inputs.Depth);
-		D3D11_TEXTURE2D_DESC motionDesc = Dx.GetDesc(inputs.MotionVectors);
 		Twin sceneTwin = this.scene ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
 		Twin outputTwin = this.output ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
-		Twin depthTwin = this.depth ??= this.bridge.CreateTwin(DXGI_FORMAT_R32_FLOAT, depthDesc.Width, depthDesc.Height);
+		Twin depthTwin = this.depth ??= this.bridge.CreateTwinLike(inputs.Depth, DXGI_FORMAT_R32_FLOAT);
 		Twin? directMotion = this.bridge.Direct(inputs.MotionVectors);
-		Twin motionTwin = directMotion ?? (this.motionVectors ??= this.bridge.CreateTwin(motionDesc.Format, motionDesc.Width, motionDesc.Height));
+		Twin motionTwin = directMotion ?? (this.motionVectors ??= this.bridge.CreateTwinLike(inputs.MotionVectors));
 
 		// D3D11 copies the inputs into the twins, unless D3D12 reads them directly
 		Bridge.Copy(d3d11, sceneTwin.Texture11, inputs.Scene, sceneTwin.Input);
@@ -174,12 +182,14 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 			Bridge.Copy(d3d11, motionTwin.Texture11, inputs.MotionVectors, motionTwin.Input);
 		this.bridge.CopyDepth(d3d11, inputs.Depth, depthTwin, inputs.RenderWidth, inputs.RenderHeight);
 
-		FrameInputs frame = inputs;
-		bool reset = inputs.Reset || this.first;
+		RecordState state = new()
+		{
+			Generator = this, Inputs = inputs, Resources = new GenerationResources(sceneTwin.Input, depthTwin.Input, motionTwin.Input, outputTwin.Input),
+			Reset = inputs.Reset || this.first, FrameId = ++this.frameId,
+		};
 		this.first = false;
-		ulong id = ++this.frameId;
-		GenerationResources resources = new(sceneTwin.Input, depthTwin.Input, motionTwin.Input, outputTwin.Input);
-		this.bridge.Execute(d3d11, list => this.Record(list, frame, resources, reset, id), false);
+		this.bridge.Execute(d3d11, state,
+			static (ID3D12GraphicsCommandList* list, in RecordState s) => s.Generator.Record(list, s.Inputs, s.Resources, s.Reset, s.FrameId), false);
 
 		Bridge.Copy(d3d11, result, outputTwin.Texture11, outputTwin.Input);
 	}

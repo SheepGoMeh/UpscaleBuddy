@@ -105,6 +105,9 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	/// </summary>
 	public bool Generate(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* output)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.FrameGenerationSync);
+#endif
 		if (!this.TakeInputs(scene, out FrameInputs inputs))
 			return false;
 
@@ -127,6 +130,9 @@ public unsafe class FrameGenerationRunner(UpscaleBuddyConfiguration configuratio
 	public GenerationTicket? Submit(ID3D11DeviceContext* context, KernelTexture* scene, KernelTexture* ui, bool uiDrawn, in FinishConstants finish,
 		int lutIndex)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.FrameGenerationSubmit);
+#endif
 		if (!this.TakeInputs(scene, out FrameInputs inputs))
 			return null;
 

@@ -54,7 +54,14 @@ public class UpscaleBuddyPlugin: IDalamudPlugin
 		Service.Framework.Update += this.OnFrameworkUpdate;
 	}
 
-	private void OnFrameworkUpdate(IFramework framework) => this.dlssPath.Update();
+	private void OnFrameworkUpdate(IFramework framework)
+	{
+		this.dlssPath.Update();
+#if DEBUG
+		if (PerfLog.Report(typeof(UpscaleBuddyPlugin).Assembly.GetName().Version, this.dlssPath.Status, this.frameGeneration.Status) is { } line)
+			Service.PluginLog.Information(line);
+#endif
+	}
 
 	protected virtual void Dispose(bool disposing)
 	{

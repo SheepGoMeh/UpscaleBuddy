@@ -864,6 +864,9 @@ public unsafe class DlssPath: IDisposable
 	/// </summary>
 	private int EvaluateDetour(ID3D11DeviceContext* context, nint handle, nint parameterObject, nint progress)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.Upscale);
+#endif
 		if (this.nativeHooked)
 			return this.EvaluateNative(context, handle, parameterObject, progress);
 

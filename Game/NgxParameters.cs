@@ -97,18 +97,36 @@ public unsafe class NgxParameters: IDisposable
 		return Marshal.GetFunctionPointerForDelegate(callback);
 	}
 
-	private void SetNumber(nint name, double value) => this.SetNumber(Marshal.PtrToStringAnsi(name)!, value);
+	private void SetNumber(nint name, double value)
+	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.NgxParameter);
+#endif
+		this.SetNumber(Marshal.PtrToStringAnsi(name)!, value);
+	}
 
-	private void SetPointer(nint name, nint value) => this.SetPointer(Marshal.PtrToStringAnsi(name)!, value);
+	private void SetPointer(nint name, nint value)
+	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.NgxParameter);
+#endif
+		this.SetPointer(Marshal.PtrToStringAnsi(name)!, value);
+	}
 
 	private bool TryNumber(nint name, out double value)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.NgxParameter);
+#endif
 		lock (this.storeLock)
 			return this.numbers.TryGetValue(Marshal.PtrToStringAnsi(name)!, out value);
 	}
 
 	private bool TryPointer(nint name, out nint value)
 	{
+#if DEBUG
+		using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.NgxParameter);
+#endif
 		lock (this.storeLock)
 			return this.pointers.TryGetValue(Marshal.PtrToStringAnsi(name)!, out value);
 	}

@@ -157,6 +157,10 @@ public sealed unsafe class AsyncGenerator: IDisposable
 	{
 		foreach (Job job in this.jobs.GetConsumingEnumerable())
 		{
+#if DEBUG
+			PerfLog.WorkerJob();
+			using PerfLog.Scope perf = PerfLog.Measure(PerfLog.Probe.FrameGenerationWorker);
+#endif
 			try
 			{
 				if (this.failure != null)

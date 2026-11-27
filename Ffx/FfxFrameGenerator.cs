@@ -170,13 +170,11 @@ public unsafe class FfxFrameGenerator: IFrameGenerator
 
 	public void Generate(ID3D11DeviceContext* d3d11, in FrameInputs inputs, ID3D11Texture2D* result)
 	{
-		D3D11_TEXTURE2D_DESC depthDesc = Dx.GetDesc(inputs.Depth);
-		D3D11_TEXTURE2D_DESC motionDesc = Dx.GetDesc(inputs.MotionVectors);
 		Twin sceneTwin = this.scene ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
 		Twin outputTwin = this.output ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
-		Twin depthTwin = this.depth ??= this.bridge.CreateTwin(DXGI_FORMAT_R32_FLOAT, depthDesc.Width, depthDesc.Height);
+		Twin depthTwin = this.depth ??= this.bridge.CreateTwinLike(inputs.Depth, DXGI_FORMAT_R32_FLOAT);
 		Twin? directMotion = this.bridge.Direct(inputs.MotionVectors);
-		Twin motionTwin = directMotion ?? (this.motionVectors ??= this.bridge.CreateTwin(motionDesc.Format, motionDesc.Width, motionDesc.Height));
+		Twin motionTwin = directMotion ?? (this.motionVectors ??= this.bridge.CreateTwinLike(inputs.MotionVectors));
 
 		// D3D11 copies the inputs into the twins, unless D3D12 reads them directly
 		Bridge.Copy(d3d11, sceneTwin.Texture11, inputs.Scene, sceneTwin.Input);

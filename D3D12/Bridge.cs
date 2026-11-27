@@ -406,6 +406,13 @@ public unsafe class Bridge: IDisposable
 		}
 	}
 
+	/// <summary>Our twin at the size of source, in the format of source unless a format is given</summary>
+	public Twin CreateTwinLike(ID3D11Texture2D* source, DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN)
+	{
+		D3D11_TEXTURE2D_DESC desc = Dx.GetDesc(source);
+		return this.CreateTwin(format == DXGI_FORMAT_UNKNOWN ? desc.Format : format, desc.Width, desc.Height);
+	}
+
 	public static void Release(Twin? twin)
 	{
 		if (twin == null)

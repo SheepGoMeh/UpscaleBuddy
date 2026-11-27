@@ -103,15 +103,12 @@ public sealed unsafe class AsyncGenerator: IDisposable
 			return null;
 		}
 
-		D3D11_TEXTURE2D_DESC depthDesc = Dx.GetDesc(inputs.Depth);
-		D3D11_TEXTURE2D_DESC motionDesc = Dx.GetDesc(inputs.MotionVectors);
-		D3D11_TEXTURE2D_DESC uiDesc = Dx.GetDesc(ui);
 		slot.Scene ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
 		slot.Generated ??= this.bridge.CreateTwin(DXGI_FORMAT_B8G8R8A8_UNORM, this.width, this.height);
 		slot.Finished ??= this.bridge.CreateTwin(DXGI_FORMAT_R8G8B8A8_TYPELESS, this.width, this.height);
-		slot.Depth ??= this.bridge.CreateTwin(DXGI_FORMAT_R32_FLOAT, depthDesc.Width, depthDesc.Height);
-		slot.MotionVectors ??= this.bridge.CreateTwin(motionDesc.Format, motionDesc.Width, motionDesc.Height);
-		slot.Ui ??= this.bridge.CreateTwin(uiDesc.Format, uiDesc.Width, uiDesc.Height);
+		slot.Depth ??= this.bridge.CreateTwinLike(inputs.Depth, DXGI_FORMAT_R32_FLOAT);
+		slot.MotionVectors ??= this.bridge.CreateTwinLike(inputs.MotionVectors);
+		slot.Ui ??= this.bridge.CreateTwinLike(ui);
 
 		Bridge.Copy(context, slot.Scene.Texture11, inputs.Scene, slot.Scene.Input);
 		Bridge.Copy(context, slot.MotionVectors.Texture11, inputs.MotionVectors, slot.MotionVectors.Input);

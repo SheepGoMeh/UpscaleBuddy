@@ -212,6 +212,8 @@ public unsafe class Fsr3Upscaler: IUpscaler
 	private readonly ID3D11Buffer* constantBuffer;
 	private readonly ID3D11Buffer* spdBuffer;
 	private readonly ID3D11Buffer* rcasBuffer;
+	private SpdConstants? uploadedSpd; // The content of spdBuffer
+	private RcasConstants? uploadedRcas; // The content of rcasBuffer
 	private readonly ID3D11SamplerState*[] samplers = new ID3D11SamplerState*[2];
 
 	private readonly GpuTimer timer;
@@ -389,8 +391,8 @@ public unsafe class Fsr3Upscaler: IUpscaler
 		};
 
 		Dx.Upload(context, this.constantBuffer, this.constants);
-		Dx.Upload(context, this.spdBuffer, spd);
-		Dx.Upload(context, this.rcasBuffer, rcas);
+		Dx.UploadIfChanged(context, this.spdBuffer, spd, ref this.uploadedSpd);
+		Dx.UploadIfChanged(context, this.rcasBuffer, rcas, ref this.uploadedRcas);
 
 		int currentLuma = odd ? 1 : 0;
 		int previousLuma = odd ? 0 : 1;

@@ -82,6 +82,7 @@ public unsafe class EffectMask: IDisposable
 	private ID3D11Device* device;
 	private ID3D11ComputeShader* shader;
 	private ID3D11Buffer* constantBuffer;
+	private Constants? uploaded; // The content of constantBuffer
 	private ID3D11Texture2D* reactive;
 	private ID3D11UnorderedAccessView* reactiveUav;
 	private nint clearedMask;
@@ -282,7 +283,7 @@ public unsafe class EffectMask: IDisposable
 
 	private void Convert(ID3D11DeviceContext* context, KernelTexture* mask, uint width, uint height)
 	{
-		Dx.Upload(context, this.constantBuffer, new Constants { Scale = this.responsiveness });
+		Dx.UploadIfChanged(context, this.constantBuffer, new Constants { Scale = this.responsiveness }, ref this.uploaded);
 		ID3D11ShaderResourceView* srv = (ID3D11ShaderResourceView*)mask->D3D11ShaderResourceView;
 		ID3D11UnorderedAccessView* uav = this.reactiveUav;
 		ID3D11Buffer* buffer = this.constantBuffer;
